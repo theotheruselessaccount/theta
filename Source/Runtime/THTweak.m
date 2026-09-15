@@ -56,6 +56,7 @@ static void InitializeHooks(void) {
     THRegisterCommentTextCopyHooks();
     THRegisterGetStoryMentionsHooks();
     THRegisterSaveAudioNotesHooks();
+    THRegisterSaveInstantsHooks();
     THRegisterSortUserGridPostsHooks();
     THRegisterFeedUsernameSpoofHooks();
     THRegisterToastDismissHooks();
@@ -148,12 +149,26 @@ static void RunSideloadSetupOnce(void) {
             // Install mkdir hook before containerURL — containerURL uses orig_createDirectoryAtPath.
             NullHookMessageEx(objc_getClass("NSFileManager"), @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:), (void *)hook_createDirectoryAtPath, &orig_createDirectoryAtPath);
             NullHookMessageEx(objc_getClass("NSFileManager"), @selector(containerURLForSecurityApplicationGroupIdentifier:), (void *)hook_NSFileManager, &orig_NSFileManager);
+            ThetaHPKESetContainerOrig((ThetaHPKEContainerURLFn)orig_NSFileManager);
+            ThetaHPKEDumpStatus();
             if (!orig_NSFileManager || !orig_createDirectoryAtPath) {
                 NSLog(@"[Theta] Sideload NSFileManager hooks incomplete (orig_container=%p orig_mkdir=%p)",
                       orig_NSFileManager, orig_createDirectoryAtPath);
             } else {
                 NSLog(@"[Theta] Sideload keychain/container hooks installed");
             }
+            NSString *root = [NSBundle mainBundle].bundlePath;
+            NSArray *checks = @[
+                @"PlugIns/InstagramNotificationExtension.appex",
+                @"Frameworks/ThetaNSE.framework/ThetaNSE",
+                @"PlugIns/InstagramNotificationExtension.appex/Frameworks/ThetaNSE.framework/ThetaNSE",
+                @"PlugIns/InstagramNotificationExtension.appex/ThetaNSE.dylib",
+            ];
+            for (NSString *rel in checks) {
+                BOOL ok = [[NSFileManager defaultManager] fileExistsAtPath:[root stringByAppendingPathComponent:rel]];
+                fprintf(stderr, "[Theta] NSE embed %s = %d\n", rel.UTF8String ?: "?", ok ? 1 : 0);
+            }
+            fflush(stderr);
         } @catch (NSException *e) {
             NSLog(@"[Theta] Sideload setup exception: %@", e);
         }
@@ -198,9 +213,19 @@ static void ObserveAppLifecycle(void) {
 __attribute__((constructor))
 static void ThetaLoad(void) {
 #ifdef SIDELOAD
-    install_fishhook_rebindings();
+    // Discover the real keychain group before remapping SecItem* onto it.
     RunSideloadSetupOnce();
+    install_fishhook_rebindings();
     dispatch_async(dispatch_get_main_queue(), ^{ RunSideloadSetupOnce(); });
+    NSString *wildcard = nil;
+    NSRange dot = [keychainAccessGroup rangeOfString:@"."];
+    if (dot.location != NSNotFound)
+        wildcard = [[keychainAccessGroup substringToIndex:dot.location] stringByAppendingString:@".*"];
+    ThetaHPKEMirrorKeychain(keychainAccessGroup, wildcard);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        ThetaHPKEMirrorKeychain(keychainAccessGroup, wildcard);
+    });
 #endif
 
     THRegisterLiquidGlassTabBarEarlyHooks();

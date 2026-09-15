@@ -1,5 +1,8 @@
 static void loadKeychainAccessGroup() {
 	@try {
+		// Probe the group iOS actually assigns. Do not guess TEAM.bundleID —
+		// resigners often entitle a different first keychain-access-group, and
+		// writing to a guessed group makes the next launch look logged out.
 		NSDictionary* dummyItem = @{
 			(__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
 			(__bridge id)kSecAttrAccount : @"dummyItem",
@@ -47,6 +50,17 @@ static void SideloadEnsureDirectoryPath(id fileManager, NSString *path) {
 
 static NSURL *hook_NSFileManager(id self, SEL _cmd, NSString *groupIdentifier) {
 	@try {
+		if (orig_NSFileManager && groupIdentifier.length) {
+			NSURL *realURL = orig_NSFileManager(self, _cmd, groupIdentifier);
+			if (realURL.path.length) {
+				NSString *probe = [realURL.path stringByAppendingPathComponent:@".theta_group_probe"];
+				BOOL ok = [@"ok" writeToFile:probe atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+				if (ok) {
+					[[NSFileManager defaultManager] removeItemAtPath:probe error:NULL];
+					return realURL;
+				}
+			}
+		}
 		if (!groupIdentifier || !fakeGroupContainerURL) {
 			return orig_NSFileManager ? orig_NSFileManager(self, _cmd, groupIdentifier) : nil;
 		}

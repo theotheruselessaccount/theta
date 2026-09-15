@@ -28,6 +28,8 @@ NSString *appVersion;
 NSString *keychainAccessGroup;
 NSURL *fakeGroupContainerURL;
 static BOOL shouldBeSeen = false;
+static BOOL s_thetaAllowStorySeenReceipts = false;
+static BOOL s_thetaLocalSeenMarkActive = false;
 static BOOL storeUserSearch = NO;
 static NSTimeInterval lastSpamTime = 0;
 static BOOL hooksInitialized = NO;

@@ -16,8 +16,14 @@ static void *theta_dlopen_substrate(void) {
     handle = dlopen("@executable_path/CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOW);
     if (handle) return handle;
 
+    /* Notification service extension: executable lives in PlugIns/*.appex */
+    handle = dlopen("@executable_path/../../CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOW);
+    if (handle) return handle;
+
     /* Fallback: some IPAs still place it under Frameworks/ */
     handle = dlopen("@executable_path/Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOW);
+    if (handle) return handle;
+    handle = dlopen("@executable_path/../../Frameworks/CydiaSubstrate.framework/CydiaSubstrate", RTLD_NOW);
     if (handle) return handle;
 
     handle = dlopen("CydiaSubstrate", RTLD_NOW);

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional merge onto Instagram.app and InstagramNotificationExtension.appex EXECUTABLES only.
+  Do not apply to ThetaNSE.framework, CydiaSubstrate, or any other dylib.
+  AMFI rejects libraries that carry entitlements ("has entitlements but is not a main binary").
+
+  Replace TEAMID with the signing Team ID. Official Instagram uses TEAMID.platformFamily
+  + TEAMID.shared on both the app and the NSE. Sideload resigners often grant TEAMID.*
+  instead; Theta probes that group at runtime and does not require this plist.
+-->
+<plist version="1.0">
+<dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TEAMID.platformFamily</string>
+		<string>TEAMID.shared</string>
+		<string>TEAMID.com.burbn.instagram</string>
+		<string>TEAMID.com.burbn.instagram.notificationextension</string>
+	</array>
+</dict>
+</plist>

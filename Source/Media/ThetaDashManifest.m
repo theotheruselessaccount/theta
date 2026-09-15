@@ -1,6 +1,8 @@
 #import "Include/ThetaDashManifest.h"
 #import <Photos/Photos.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 
 static NSString *ThetaDashExtractBaseURLAfterRangeInBlock(NSString *block, NSRange repTagRange);
 
@@ -183,7 +185,9 @@ NSArray<ThetaDashVideoQuality *> *ThetaDashManifestVideoQualities(NSString *mani
             || [block.lowercaseString containsString:@"codecs=\"av01"]
             || [block.lowercaseString containsString:@"codecs=\"avc1"]
             || [block.lowercaseString containsString:@"codecs=\"hvc1"]
-            || [block.lowercaseString containsString:@"codecs=\"hev1"];
+            || [block.lowercaseString containsString:@"codecs=\"hev1"]
+            || [block.lowercaseString containsString:@"codecs=\"vp09"]
+            || [block.lowercaseString containsString:@"codecs=\"vp9"];
         if (!looksLikeVideo) continue;
 
         NSRegularExpression *repRe = [NSRegularExpression regularExpressionWithPattern:@"<Representation\\b[^>]*>" options:NSRegularExpressionCaseInsensitive error:nil];
@@ -567,8 +571,13 @@ static NSString *ThetaTranscodeAudioToM4A(AVAsset *asset, NSString *sourcePath) 
     [fm removeItemAtPath:outPath error:nil];
     AVAssetExportSession *session = [AVAssetExportSession exportSessionWithAsset:asset presetName:AVAssetExportPresetAppleM4A];
     if (!session) return nil;
-    session.outputURL = [NSURL fileURLWithPath:outPath];
-    session.outputFileType = AVFileTypeAppleM4A;
+    @try {
+        session.outputFileType = AVFileTypeAppleM4A;
+        session.outputURL = [NSURL fileURLWithPath:outPath];
+    } @catch (NSException *e) {
+        NSLog(@"ThetaTranscodeAudioToM4A: session config threw %@: %@", e.name, e.reason);
+        return nil;
+    }
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block BOOL ok = NO;
     [session exportAsynchronouslyWithCompletionHandler:^{
@@ -611,8 +620,276 @@ NSString *ThetaPrepareDashAudioForMerge(NSString *audioPath) {
     return nil;
 }
 
+static CGSize ThetaVideoTrackEncodedSize(AVAssetTrack *track) {
+    // Encoder size must match the decoded buffers, not the display orientation.
+    // Rotation is applied via AVAssetWriterInput.transform.
+    CGSize size = track.naturalSize;
+    if (size.width < 2 || size.height < 2) {
+        NSArray *descs = track.formatDescriptions;
+        if (descs.count) {
+            CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions((__bridge CMVideoFormatDescriptionRef)descs[0]);
+            if (dims.width >= 2 && dims.height >= 2) {
+                size = CGSizeMake(dims.width, dims.height);
+            }
+        }
+    }
+    return size;
+}
+
+static int ThetaEvenDimension(CGFloat value) {
+    int n = (int)llround(value);
+    if (n < 2) return 2;
+    return n & ~1;
+}
+
+BOOL ThetaTranscodeWithAssetReaderWriter(NSString *videoPath, NSString *audioPath, BOOL hasAudio, NSString *outputPath) {
+    if (videoPath.length == 0 || outputPath.length == 0) return NO;
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        AVAsset *videoAsset = [AVAsset assetWithURL:[NSURL fileURLWithPath:videoPath]];
+        ThetaAVAssetLoadKeys(videoAsset);
+        AVAssetTrack *videoTrack = [[videoAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        if (!videoTrack) {
+            NSLog(@"ThetaReaderWriter: no video track");
+            return NO;
+        }
+
+        CGSize srcSize = ThetaVideoTrackEncodedSize(videoTrack);
+        int width = ThetaEvenDimension(srcSize.width);
+        int height = ThetaEvenDimension(srcSize.height);
+        if (width < 2 || height < 2) {
+            NSLog(@"ThetaReaderWriter: invalid size %.0fx%.0f", srcSize.width, srcSize.height);
+            return NO;
+        }
+
+        NSArray<NSNumber *> *pixelFormats = @[
+            @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+            @(kCVPixelFormatType_32BGRA),
+        ];
+
+        NSString *preparedAudio = nil;
+        if (hasAudio && audioPath.length && [fm fileExistsAtPath:audioPath]) {
+            preparedAudio = ThetaPrepareDashAudioForMerge(audioPath);
+        }
+
+        for (NSNumber *pixelFormat in pixelFormats) {
+            if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+
+            NSError *readerErr = nil;
+            AVAssetReader *videoReader = [AVAssetReader assetReaderWithAsset:videoAsset error:&readerErr];
+            if (!videoReader) {
+                NSLog(@"ThetaReaderWriter: video reader %@", readerErr);
+                return NO;
+            }
+            AVAssetReaderTrackOutput *videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTrack outputSettings:@{
+                (id)kCVPixelBufferPixelFormatTypeKey: pixelFormat
+            }];
+            videoOutput.alwaysCopiesSampleData = NO;
+            if (![videoReader canAddOutput:videoOutput]) continue;
+            [videoReader addOutput:videoOutput];
+
+            AVAsset *audioAsset = nil;
+            AVAssetReader *audioReader = nil;
+            AVAssetReaderTrackOutput *audioOutput = nil;
+            if (preparedAudio.length) {
+                audioAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:preparedAudio] options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @YES}];
+                ThetaAVAssetLoadKeys(audioAsset);
+                AVAssetTrack *audioTrack = [[audioAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+                if (audioTrack) {
+                    NSError *audioErr = nil;
+                    audioReader = [AVAssetReader assetReaderWithAsset:audioAsset error:&audioErr];
+                    if (audioReader) {
+                        audioOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTrack outputSettings:@{
+                            AVFormatIDKey: @(kAudioFormatLinearPCM),
+                            AVLinearPCMBitDepthKey: @16,
+                            AVLinearPCMIsBigEndianKey: @NO,
+                            AVLinearPCMIsFloatKey: @NO,
+                            AVLinearPCMIsNonInterleaved: @NO,
+                        }];
+                        audioOutput.alwaysCopiesSampleData = NO;
+                        if ([audioReader canAddOutput:audioOutput]) {
+                            [audioReader addOutput:audioOutput];
+                        } else {
+                            audioReader = nil;
+                            audioOutput = nil;
+                        }
+                    }
+                }
+            }
+
+            NSError *writerErr = nil;
+            AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:[NSURL fileURLWithPath:outputPath] fileType:AVFileTypeMPEG4 error:&writerErr];
+            if (!writer) {
+                NSLog(@"ThetaReaderWriter: writer %@", writerErr);
+                return NO;
+            }
+
+            NSMutableDictionary *compression = [@{
+                AVVideoAverageBitRateKey: @(MAX(1, width * height * 4)),
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoExpectedSourceFrameRateKey: @(videoTrack.nominalFrameRate > 1 ? videoTrack.nominalFrameRate : 30),
+            } mutableCopy];
+            NSDictionary *videoSettings = @{
+                AVVideoCodecKey: AVVideoCodecTypeH264,
+                AVVideoWidthKey: @(width),
+                AVVideoHeightKey: @(height),
+                AVVideoCompressionPropertiesKey: compression,
+            };
+            if (![writer canApplyOutputSettings:videoSettings forMediaType:AVMediaTypeVideo]) {
+                videoSettings = @{
+                    AVVideoCodecKey: AVVideoCodecTypeH264,
+                    AVVideoWidthKey: @(width),
+                    AVVideoHeightKey: @(height),
+                };
+            }
+            AVAssetWriterInput *videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+            videoInput.expectsMediaDataInRealTime = NO;
+            videoInput.transform = videoTrack.preferredTransform;
+            if (![writer canAddInput:videoInput]) {
+                NSLog(@"ThetaReaderWriter: cannot add video input");
+                continue;
+            }
+            [writer addInput:videoInput];
+
+            AVAssetWriterInput *audioInput = nil;
+            if (audioOutput) {
+                audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{
+                    AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+                    AVNumberOfChannelsKey: @2,
+                    AVSampleRateKey: @44100,
+                    AVEncoderBitRateKey: @128000,
+                }];
+                audioInput.expectsMediaDataInRealTime = NO;
+                if ([writer canAddInput:audioInput]) {
+                    [writer addInput:audioInput];
+                } else {
+                    audioInput = nil;
+                    audioReader = nil;
+                    audioOutput = nil;
+                }
+            }
+
+            if (![videoReader startReading]) {
+                NSLog(@"ThetaReaderWriter: startReading video %@", videoReader.error);
+                continue;
+            }
+            if (audioReader && ![audioReader startReading]) {
+                NSLog(@"ThetaReaderWriter: startReading audio %@", audioReader.error);
+                audioReader = nil;
+                audioOutput = nil;
+                audioInput = nil;
+            }
+            if (![writer startWriting]) {
+                NSLog(@"ThetaReaderWriter: startWriting %@", writer.error);
+                continue;
+            }
+            [writer startSessionAtSourceTime:kCMTimeZero];
+
+            dispatch_queue_t pump = dispatch_queue_create("theta.readerwriter", DISPATCH_QUEUE_SERIAL);
+            dispatch_semaphore_t done = dispatch_semaphore_create(0);
+            __block BOOL videoFinished = NO;
+            __block BOOL audioFinished = (audioInput == nil);
+            __block BOOL signaled = NO;
+            void (^signalIfDone)(void) = ^{
+                if (videoFinished && audioFinished && !signaled) {
+                    signaled = YES;
+                    dispatch_semaphore_signal(done);
+                }
+            };
+
+            [videoInput requestMediaDataWhenReadyOnQueue:pump usingBlock:^{
+                while (videoInput.readyForMoreMediaData) {
+                    CMSampleBufferRef sample = [videoOutput copyNextSampleBuffer];
+                    if (!sample) {
+                        [videoInput markAsFinished];
+                        videoFinished = YES;
+                        signalIfDone();
+                        return;
+                    }
+                    BOOL appended = [videoInput appendSampleBuffer:sample];
+                    CFRelease(sample);
+                    if (!appended) {
+                        [videoInput markAsFinished];
+                        videoFinished = YES;
+                        signalIfDone();
+                        return;
+                    }
+                }
+            }];
+
+            if (audioInput && audioOutput) {
+                [audioInput requestMediaDataWhenReadyOnQueue:pump usingBlock:^{
+                    while (audioInput.readyForMoreMediaData) {
+                        CMSampleBufferRef sample = [audioOutput copyNextSampleBuffer];
+                        if (!sample) {
+                            [audioInput markAsFinished];
+                            audioFinished = YES;
+                            signalIfDone();
+                            return;
+                        }
+                        BOOL appended = [audioInput appendSampleBuffer:sample];
+                        CFRelease(sample);
+                        if (!appended) {
+                            [audioInput markAsFinished];
+                            audioFinished = YES;
+                            signalIfDone();
+                            return;
+                        }
+                    }
+                }];
+            }
+
+            dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+
+            dispatch_semaphore_t finishSem = dispatch_semaphore_create(0);
+            [writer finishWritingWithCompletionHandler:^{
+                dispatch_semaphore_signal(finishSem);
+            }];
+            dispatch_semaphore_wait(finishSem, DISPATCH_TIME_FOREVER);
+
+            NSDictionary *attrs = [fm attributesOfItemAtPath:outputPath error:nil];
+            if (writer.status == AVAssetWriterStatusCompleted && attrs.fileSize > 0) {
+                NSLog(@"ThetaReaderWriter: wrote %@ (%llu bytes) pix=%@", outputPath, (unsigned long long)attrs.fileSize, pixelFormat);
+                return YES;
+            }
+            NSLog(@"ThetaReaderWriter: write failed status=%ld err=%@ pix=%@", (long)writer.status, writer.error, pixelFormat);
+            [fm removeItemAtPath:outputPath error:nil];
+        }
+        return NO;
+    } @catch (NSException *e) {
+        NSLog(@"ThetaReaderWriter threw %@: %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+BOOL ThetaVideoFourCCNeedsFFmpegTranscode(FourCharCode codec) {
+    switch (codec) {
+        case 'av01':
+        case 'vp09':
+        case 'VP90':
+        case 'vp9 ':
+        case 'vp08':
+        case 'VP80':
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+BOOL ThetaAssetVideoNeedsFFmpegTranscode(AVAsset *asset) {
+    if (!asset) return YES;
+    NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (tracks.count == 0) return YES;
+    NSArray *descs = [tracks.firstObject formatDescriptions];
+    if (descs.count == 0) return YES;
+    CMFormatDescriptionRef formatDesc = (__bridge CMFormatDescriptionRef)descs[0];
+    return ThetaVideoFourCCNeedsFFmpegTranscode(CMFormatDescriptionGetMediaSubType(formatDesc));
+}
+
 BOOL ThetaExportPhotosCompatibleMP4(NSString *videoPath, NSString *audioPath, BOOL hasAudio, NSString *outputPath) {
     if (videoPath.length == 0 || outputPath.length == 0) return NO;
+    @try {
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
 
@@ -671,27 +948,43 @@ BOOL ThetaExportPhotosCompatibleMP4(NSString *videoPath, NSString *audioPath, BO
 
     NSURL *outURL = [NSURL fileURLWithPath:outputPath];
     for (NSString *preset in toTry) {
-        if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
-        AVAssetExportSession *session = [AVAssetExportSession exportSessionWithAsset:composition presetName:preset];
-        if (!session) continue;
-        session.outputURL = outURL;
-        session.outputFileType = AVFileTypeMPEG4;
-        if ([session respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
-            session.shouldOptimizeForNetworkUse = YES;
+        @try {
+            if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+            AVAssetExportSession *session = [AVAssetExportSession exportSessionWithAsset:composition presetName:preset];
+            if (!session) continue;
+            // outputURL throws if the file type is unset or unsupported (VP9/AV1 on iOS 27).
+            NSArray *types = session.supportedFileTypes ?: @[];
+            NSString *fileType = nil;
+            if ([types containsObject:AVFileTypeMPEG4]) fileType = AVFileTypeMPEG4;
+            else if ([types containsObject:AVFileTypeQuickTimeMovie]) fileType = AVFileTypeQuickTimeMovie;
+            else if (types.count) fileType = types.firstObject;
+            if (!fileType) continue;
+            session.outputFileType = fileType;
+            session.outputURL = outURL;
+            if ([session respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
+                session.shouldOptimizeForNetworkUse = YES;
+            }
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            __block BOOL ok = NO;
+            [session exportAsynchronouslyWithCompletionHandler:^{
+                ok = (session.status == AVAssetExportSessionStatusCompleted);
+                if (!ok) NSLog(@"ThetaExportPhotosCompatibleMP4 preset %@ failed: %@ status %ld", preset, session.error, (long)session.status);
+                dispatch_semaphore_signal(sem);
+            }];
+            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            NSDictionary *attrs = [fm attributesOfItemAtPath:outputPath error:nil];
+            if (ok && attrs && [attrs fileSize] > 0) return YES;
+            [fm removeItemAtPath:outputPath error:nil];
+        } @catch (NSException *e) {
+            NSLog(@"ThetaExportPhotosCompatibleMP4 preset %@ threw %@: %@", preset, e.name, e.reason);
+            [fm removeItemAtPath:outputPath error:nil];
         }
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block BOOL ok = NO;
-        [session exportAsynchronouslyWithCompletionHandler:^{
-            ok = (session.status == AVAssetExportSessionStatusCompleted);
-            if (!ok) NSLog(@"ThetaExportPhotosCompatibleMP4 preset %@ failed: %@ status %ld", preset, session.error, (long)session.status);
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        NSDictionary *attrs = [fm attributesOfItemAtPath:outputPath error:nil];
-        if (ok && attrs && [attrs fileSize] > 0) return YES;
-        [fm removeItemAtPath:outputPath error:nil];
     }
     return NO;
+    } @catch (NSException *e) {
+        NSLog(@"ThetaExportPhotosCompatibleMP4 threw %@: %@", e.name, e.reason);
+        return NO;
+    }
 }
 
 void ThetaPhotoLibraryImportVideoFromURL(NSURL *fileURL, void (^completion)(BOOL success, NSError *error)) {

@@ -1,4 +1,7 @@
 /* Sideload fishhook rebindings (strlen / SecItem*) */
+#ifdef SIDELOAD
+#import "Source/SideloadNSE/ThetaHPKEKeyFile.h"
+#endif
 // Keychain hook via fishhook (file scope)
 static OSStatus (*original_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
 static OSStatus (*original_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result);
@@ -121,6 +124,20 @@ static OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *res
     CFDictionaryRef rewritten = SideloadSecItemDictCopy(query, YES);
     OSStatus status = real_SecItemCopyMatching(rewritten ? rewritten : query, result);
     if (rewritten) CFRelease(rewritten);
+    if (status == errSecSuccess && result && *result && ThetaHPKEDictIsHPKE(query)) {
+        if (CFGetTypeID(*result) == CFDataGetTypeID()) {
+            NSMutableDictionary *attrs = [NSMutableDictionary dictionaryWithDictionary:(__bridge NSDictionary *)query];
+            attrs[(__bridge id)kSecValueData] = (__bridge NSData *)*result;
+            ThetaHPKESave((__bridge CFDictionaryRef)attrs);
+        } else if (CFGetTypeID(*result) == CFDictionaryGetTypeID()) {
+            ThetaHPKESaveFromQueryAndAttrs(query, (CFDictionaryRef)*result);
+        }
+        return status;
+    }
+    if (status != errSecSuccess && ThetaHPKEDictIsHPKE(query)) {
+        OSStatus fileSt = ThetaHPKECopyMatching(query, result);
+        if (fileSt == errSecSuccess) return fileSt;
+    }
     return status;
 #else
     return real_SecItemCopyMatching(query, result);
@@ -146,6 +163,7 @@ static OSStatus hooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
     CFDictionaryRef rewritten = SideloadSecItemDictCopy(attributes, NO);
     OSStatus status = real_SecItemAdd(rewritten ? rewritten : attributes, result);
     if (rewritten) CFRelease(rewritten);
+    ThetaHPKESave(attributes);
     // Item already in the sideload keychain — that *is* persistence.
     if (status == errSecDuplicateItem) return errSecSuccess;
     if (status != errSecSuccess) {
@@ -166,6 +184,7 @@ static OSStatus hooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attr
     OSStatus status = real_SecItemUpdate(q ? q : query, a ? a : attributesToUpdate);
     if (q) CFRelease(q);
     if (a) CFRelease(a);
+    ThetaHPKESaveFromQueryAndAttrs(query, attributesToUpdate);
     return status;
 #else
     return real_SecItemUpdate(query, attributesToUpdate);

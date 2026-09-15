@@ -1,6 +1,6 @@
 Package: com.theta.tweak
 Name: Theta
-Version: 1.0.0
+Version: 1.0.1
 Architecture: iphoneos-arm
 Description: Instagram tweak — clean rebuild without DRM/obfuscation
 Maintainer: local

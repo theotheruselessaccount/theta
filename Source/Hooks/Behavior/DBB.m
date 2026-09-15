@@ -78,21 +78,6 @@ void THRegisterDeferredDBBHooks(void) {
         }
     }
 
-    if (!didHookPush) {
-        int n = objc_getClassList(NULL, 0);
-        if (n > 0) {
-            Class *classes = (Class *)malloc((size_t)n * sizeof(Class));
-            n = objc_getClassList(classes, n);
-            for (int i = 0; i < n; i++) {
-                if (class_getInstanceMethod(classes[i], selPush)) {
-                    NullHookMessageEx(classes[i], selPush, (void *)hook_handleForcedLogoutLoginPush, (void *)&orig_handleForcedLogoutLoginPush);
-                    break;
-                }
-            }
-            free(classes);
-        }
-    }
-
     // NSUserDefaults is hot-path — only install if we successfully capture orig.
     Class ud = objc_getClass("NSUserDefaults");
     if (ud) {

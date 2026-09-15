@@ -1661,22 +1661,16 @@ static void * const playerKey = &playerKey;
                     }
                 }
                 
-                // Detect video encoding
+                // Detect video encoding (load tracks first — otherwise formatDescriptions is empty)
                 AVAsset *videoAsset = [AVAsset assetWithURL:[NSURL fileURLWithPath:videoPath]];
-                NSArray<AVAssetTrack *> *videoTracks = [videoAsset tracksWithMediaType:AVMediaTypeVideo];
-                BOOL isAV1Video = NO;
-                
-                if (videoTracks.count > 0) {
-                    AVAssetTrack *videoTrack = videoTracks[0];
-                    NSArray *formatDescriptions = [videoTrack formatDescriptions];
-                    if (formatDescriptions.count > 0) {
-                        CMFormatDescriptionRef formatDesc = (__bridge CMFormatDescriptionRef)formatDescriptions[0];
-                        FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDesc);
-                        if (codec == 0x61763031) { // 'av01'
-                            isAV1Video = YES;
-                        }
-                    }
+                {
+                    dispatch_semaphore_t videoKeysSem = dispatch_semaphore_create(0);
+                    [videoAsset loadValuesAsynchronouslyForKeys:@[@"tracks", @"duration"] completionHandler:^{
+                        dispatch_semaphore_signal(videoKeysSem);
+                    }];
+                    dispatch_semaphore_wait(videoKeysSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
                 }
+                BOOL isAV1Video = ThetaAssetVideoNeedsFFmpegTranscode(videoAsset);
                 
                 // Wait for transcoding slot
                 dispatch_semaphore_wait(transcodeSemaphore, DISPATCH_TIME_FOREVER);
@@ -1693,9 +1687,11 @@ static void * const playerKey = &playerKey;
                 __block NSTimeInterval transcodeStartTime = [[NSDate date] timeIntervalSince1970];
                 
                 if (isAV1Video) {
-                    // Use AV1Transcoder for AV1 videos
+                    // FFmpeg path for AV1 / VP9 (AVAsset export cannot re-encode these)
                     NSError *transcodeError = nil;
-                    BOOL transcodeSuccess = [AV1Transcoder transcodeAV1ToH264:videoPath
+                    BOOL transcodeSuccess = ThetaTranscodeWithAssetReaderWriter(videoPath, audioPath, hasAudio, outputPath);
+                    if (!transcodeSuccess) {
+                    transcodeSuccess = [AV1Transcoder transcodeAV1ToH264:videoPath
                                                                     outputPath:outputPath
                                                                      audioPath:audioPath
                                                                          error:&transcodeError
@@ -1714,34 +1710,29 @@ static void * const playerKey = &playerKey;
                             formatProgressDisplay(); // updates inline bars per item
                         }
                     }];
+                    }
                     
                     dispatch_semaphore_signal(transcodeSemaphore);
                     
                     if (!transcodeSuccess) {
-                        NSLog(@"AV1 transcoding failed for video %ld (%@); trying native export", (long)videoIndex, transcodeError);
+                        NSLog(@"Transcoding failed for video %ld (%@)", (long)videoIndex, transcodeError);
                         if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
-                        if (!ThetaExportPhotosCompatibleMP4(videoPath, audioPath, hasAudio, outputPath)) {
-                            NSError *copyErr = nil;
-                            if (![fm copyItemAtPath:videoPath toPath:outputPath error:&copyErr]) {
-                                NSLog(@"Bulk %ld: could not copy original after transcode failure: %@", (long)videoIndex, copyErr);
-                                [fm removeItemAtPath:videoPath error:nil];
-                                if (audioPath) [fm removeItemAtPath:audioPath error:nil];
-                                dispatch_async(statsQueue, ^{
-                                    videoProgress[@(videoIndex)][@"state"] = @"done";
-                                    videoProgress[@(videoIndex)][@"status"] = @"Transcoding failed";
-                                    failedVideos++;
-                                    completedVideos++;
-                                    dispatch_async(dispatch_get_main_queue(), ^{
-                                        [progressToast updateProgressWithTitle:@"Bulk saving videos!" subtitle:formatProgressDisplay()];
-                                        if (completedVideos >= totalVideos) {
-                                            [self showCompletionToast:progressToast completed:completedVideos total:totalVideos failed:failedVideos];
-                                            [MediaSelectionViewController setDownloadInProgress:NO];
-                                        }
-                                    });
-                                });
-                                return;
-                            }
-                        }
+                        [fm removeItemAtPath:videoPath error:nil];
+                        if (audioPath) [fm removeItemAtPath:audioPath error:nil];
+                        dispatch_async(statsQueue, ^{
+                            videoProgress[@(videoIndex)][@"state"] = @"done";
+                            videoProgress[@(videoIndex)][@"status"] = @"Transcoding failed";
+                            failedVideos++;
+                            completedVideos++;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [progressToast updateProgressWithTitle:@"Bulk saving videos!" subtitle:formatProgressDisplay()];
+                                if (completedVideos >= totalVideos) {
+                                    [self showCompletionToast:progressToast completed:completedVideos total:totalVideos failed:failedVideos];
+                                    [MediaSelectionViewController setDownloadInProgress:NO];
+                                }
+                            });
+                        });
+                        return;
                     }
                     
                 } else {
@@ -1826,7 +1817,21 @@ static void * const playerKey = &playerKey;
                     
                     if (exportSession.status != AVAssetExportSessionStatusCompleted) {
                         NSLog(@"Export failed for video %ld: %@", (long)videoIndex, exportSession.error);
-                        
+                        if ([fm fileExistsAtPath:outputPath]) [fm removeItemAtPath:outputPath error:nil];
+                        NSError *transcodeError = nil;
+                        BOOL fallbackOK = [AV1Transcoder transcodeAV1ToH264:videoPath
+                                                                outputPath:outputPath
+                                                                 audioPath:hasAudio ? audioPath : nil
+                                                                     error:&transcodeError
+                                                             progressBlock:nil];
+                        if (!fallbackOK) {
+                            fallbackOK = ThetaExportPhotosCompatibleMP4(videoPath, audioPath, hasAudio, outputPath);
+                        }
+                        NSDictionary *fallbackAttrs = [fm attributesOfItemAtPath:outputPath error:nil];
+                        if (fallbackOK && fallbackAttrs && [fallbackAttrs fileSize] > 0) {
+                            // Fall through to the camera-roll / folder save below.
+                        } else {
+                        NSLog(@"Bulk %ld: FFmpeg fallback after export failure failed (%@)", (long)videoIndex, transcodeError);
                         // Cleanup
                         [fm removeItemAtPath:videoPath error:nil];
                         if (audioPath) [fm removeItemAtPath:audioPath error:nil];
@@ -1844,6 +1849,7 @@ static void * const playerKey = &playerKey;
                             });
                         });
                         return;
+                        }
                     }
                     
                 }

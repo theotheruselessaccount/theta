@@ -227,29 +227,10 @@ static void downloadHDVideoSelectingURL(IGVideo *inputVideo, NSString *selectedV
             }];
             dispatch_semaphore_wait(videoKeysSem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)));
         }
-        NSArray<AVAssetTrack *> *videoTracks = [videoAsset tracksWithMediaType:AVMediaTypeVideo];
-        BOOL isAV1Video = NO;
-        if (videoTracks.count > 0) {
-            AVAssetTrack *videoTrack = videoTracks[0];
-            NSArray *formatDescriptions = [videoTrack formatDescriptions];
-            if (formatDescriptions.count > 0) {
-                CMFormatDescriptionRef formatDesc = (__bridge CMFormatDescriptionRef)formatDescriptions[0];
-                FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDesc);
-                NSString *codecString = [NSString stringWithFormat:@"%c%c%c%c", 
-                                        (char)(codec >> 24), 
-                                        (char)(codec >> 16), 
-                                        (char)(codec >> 8), 
-                                        (char)codec];
-                
-                // Check if this is AV1 - if so, skip AVAsset merge and use FFmpeg directly
-                if (codec == 0x61763031) { // 'av01'
-                    isAV1Video = YES;
-                }
-            }
-        }
-        
-        // If AV1, skip AVAsset merge and go directly to FFmpeg transcoding
-        if (isAV1Video) {
+        // AV1 / VP9 (and anything AVFoundation cannot read) must skip AVAsset export —
+        // HighestQuality fails with "Could not prepare video for saving".
+        BOOL needsTranscode = ThetaAssetVideoNeedsFFmpegTranscode(videoAsset);
+        if (needsTranscode) {
             
             NSString *h264OutputPath = [workDir stringByAppendingPathComponent:@"output_h264.mp4"];
             
@@ -258,34 +239,34 @@ static void downloadHDVideoSelectingURL(IGVideo *inputVideo, NSString *selectedV
                 [fm removeItemAtPath:h264OutputPath error:nil];
             }
             
-            // Transcode using FFmpeg - pass original video file (not merged)
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [progressToast updateProgressWithTitle:@"Saving video" subtitle:@"Converting video..."];
+            });
+
+            // AVAsset can decode VP9 on recent iOS even though ExportSession cannot
+            // write it. Try Reader/Writer first; FFmpeg is the fallback.
+            BOOL success = ThetaTranscodeWithAssetReaderWriter(videoPath, hasAudio ? audioPath : nil, hasAudio, h264OutputPath);
             NSError *transcodeError = nil;
-            BOOL success = [AV1Transcoder transcodeAV1ToH264:videoPath 
-                                                   outputPath:h264OutputPath 
-                                                    audioPath:hasAudio ? audioPath : nil
-                                                        error:&transcodeError 
-                                                progressBlock:^(NSString *status, float progress) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [progressToast updateProgressWithTitle:@"Downloading video..."
-                                                  subtitle:@""
-                                                  progress:progress];
-                });
-            }];
+            if (!success) {
+                NSLog(@"Reader/Writer transcode failed; trying FFmpeg");
+                success = [AV1Transcoder transcodeAV1ToH264:videoPath
+                                                outputPath:h264OutputPath
+                                                 audioPath:hasAudio ? audioPath : nil
+                                                     error:&transcodeError
+                                             progressBlock:^(NSString *status, float progress) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [progressToast updateProgressWithTitle:@"Downloading video..."
+                                                      subtitle:@""
+                                                      progress:progress];
+                    });
+                }];
+            }
 
             NSString *fileToSave = h264OutputPath;
             if (!success) {
-                NSLog(@"FFmpeg transcoding failed (%@); trying native export", transcodeError);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [progressToast updateProgressWithTitle:@"Saving video" subtitle:@"Converting video..."];
-                });
-                BOOL nativeOK = ThetaExportPhotosCompatibleMP4(videoPath, audioPath, hasAudio, h264OutputPath);
-                if (nativeOK) {
-                    success = YES;
-                    fileToSave = h264OutputPath;
-                } else {
-                    NSLog(@"Native export failed; Photos may still reject original AV1");
-                    fileToSave = videoPath;
-                }
+                NSLog(@"FFmpeg transcoding failed (%@); trying original file", transcodeError);
+                fileToSave = videoPath;
+                success = YES;
             }
             
             // Save the transcoded file
@@ -500,8 +481,7 @@ static void downloadHDVideoSelectingURL(IGVideo *inputVideo, NSString *selectedV
                             CMFormatDescriptionRef formatDesc = (__bridge CMFormatDescriptionRef)checkFormatDescriptions[0];
                             FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDesc);
                             
-                            // Check if codec is AV1 (av01)
-                            if (codec == 0x61763031) { // 'av01'
+                            if (ThetaVideoFourCCNeedsFFmpegTranscode(codec)) {
                                 NSString *h264OutputPath = [workDir stringByAppendingPathComponent:@"output_h264.mp4"];
                                 
                                 // Remove if exists
@@ -759,6 +739,51 @@ static void downloadHDVideoSelectingURL(IGVideo *inputVideo, NSString *selectedV
                 }
             } else {
                 NSLog(@"Export failed with status: %ld, error: %@", (long)exportSession.status, exportSession.error);
+                NSString *fallbackPath = [workDir stringByAppendingPathComponent:@"output_h264.mp4"];
+                if ([fm fileExistsAtPath:fallbackPath]) {
+                    [fm removeItemAtPath:fallbackPath error:nil];
+                }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [progressToast updateProgressWithTitle:@"Saving video" subtitle:@"Converting video..."];
+                });
+                NSError *transcodeError = nil;
+                BOOL fallbackOK = [AV1Transcoder transcodeAV1ToH264:videoPath
+                                                         outputPath:fallbackPath
+                                                          audioPath:hasAudio ? audioPath : nil
+                                                              error:&transcodeError
+                                                      progressBlock:^(NSString *status, float progress) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [progressToast updateProgressWithTitle:@"Downloading video..."
+                                                      subtitle:@""
+                                                      progress:progress];
+                    });
+                }];
+                if (!fallbackOK) {
+                    NSLog(@"FFmpeg fallback after export failure failed (%@)", transcodeError);
+                    fallbackOK = ThetaExportPhotosCompatibleMP4(videoPath, audioPath, hasAudio, fallbackPath);
+                }
+                NSDictionary *fallbackAttrs = [fm attributesOfItemAtPath:fallbackPath error:nil];
+                if (fallbackOK && fallbackAttrs && [fallbackAttrs fileSize] > 0) {
+                    ThetaPhotoLibraryImportVideoFromURL([NSURL fileURLWithPath:fallbackPath], ^(BOOL ok, NSError *saveError) {
+                        if (ok) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                showCompletionToast(progressToast, YES, @"Saved to camera roll!", @"Tap here to go to camera roll.", [UIImage systemImageNamed:@"checkmark.circle.fill"], [NSURL URLWithString:@"photos-redirect://"]);
+                            });
+                            [fm removeItemAtPath:videoPath error:nil];
+                            if (hasAudio) [fm removeItemAtPath:audioPath error:nil];
+                            [fm removeItemAtPath:outputPath error:nil];
+                            [fm removeItemAtPath:fallbackPath error:nil];
+                        } else {
+                            NSLog(@"Fallback save failed: %@", saveError);
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                showCompletionToast(progressToast, NO, @"Error", @"Could not prepare video for saving", [UIImage systemImageNamed:@"exclamationmark.triangle"], nil);
+                            });
+                        }
+                        finishJob();
+                        dispatch_semaphore_signal(semaphore);
+                    });
+                    return;
+                }
                 dispatch_async(dispatch_get_main_queue(), ^{
                     showCompletionToast(progressToast, NO, @"Error", @"Could not prepare video for saving", [UIImage systemImageNamed:@"exclamationmark.triangle"], nil);
                 });

@@ -4,32 +4,44 @@
 #import <objc/message.h>
 #import <stdlib.h>
 
+/** Liquid Glass shipped with iOS 26. IG 444 can still enable the experiment on older OS versions; that path crashes when banners/toasts appear. */
+static inline BOOL theta_osSupportsLiquidGlass(void) {
+    return [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion >= 26;
+}
+
 /** Floating tab bar C hooks key off liquid glass surfaces only. */
 static inline BOOL theta_liquidGlassSurfacesWanted(void) {
-    return ENABLED(@"Enable Liquid Glass Surfaces");
+    return theta_osSupportsLiquidGlass() && ENABLED(@"Enable Liquid Glass Surfaces");
 }
 
 /** Homecoming experiment bypass: either LG toggle. */
 static inline BOOL theta_liquidGlassFloatingBarWanted(void) {
-    return ENABLED(@"Enable Liquid Glass Surfaces") || ENABLED(@"Enable Liquid Glass Buttons");
+    return theta_osSupportsLiquidGlass() &&
+        (ENABLED(@"Enable Liquid Glass Surfaces") || ENABLED(@"Enable Liquid Glass Buttons"));
 }
 
 // ── Liquid Glass Buttons (ObjC hooks) ────────────────────────────────────────
 
 static BOOL (*orig_swizzleToggle_isEnabled)(id, SEL) = NULL;
 static BOOL hook_swizzleToggle_isEnabled(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass())
+        return orig_swizzleToggle_isEnabled ? orig_swizzleToggle_isEnabled(self, _cmd) : NO;
     if (ENABLED(@"Enable Liquid Glass Buttons")) return YES;
     return orig_swizzleToggle_isEnabled ? orig_swizzleToggle_isEnabled(self, _cmd) : NO;
 }
 
 static BOOL (*orig_expHelper_isEnabled)(id, SEL) = NULL;
 static BOOL hook_expHelper_isEnabled(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass())
+        return orig_expHelper_isEnabled ? orig_expHelper_isEnabled(self, _cmd) : NO;
     if (ENABLED(@"Enable Liquid Glass Buttons")) return YES;
     return orig_expHelper_isEnabled ? orig_expHelper_isEnabled(self, _cmd) : NO;
 }
 
 static BOOL (*orig_expHelper_isHomeFeed)(id, SEL) = NULL;
 static BOOL hook_expHelper_isHomeFeed(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass())
+        return orig_expHelper_isHomeFeed ? orig_expHelper_isHomeFeed(self, _cmd) : NO;
     if (ENABLED(@"Enable Liquid Glass Buttons")) return YES;
     return orig_expHelper_isHomeFeed ? orig_expHelper_isHomeFeed(self, _cmd) : NO;
 }
@@ -38,73 +50,84 @@ static BOOL hook_expHelper_isHomeFeed(id self, SEL _cmd) {
 
 static BOOL (*orig_lgInAppNotif)(id, SEL) = NULL;
 static BOOL hook_lgInAppNotif(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgInAppNotif ? orig_lgInAppNotif(self, _cmd) : NO;
 }
 
 static BOOL (*orig_lgContextMenu)(id, SEL) = NULL;
 static BOOL hook_lgContextMenu(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgContextMenu ? orig_lgContextMenu(self, _cmd) : NO;
 }
 
 static BOOL (*orig_lgToast)(id, SEL) = NULL;
 static BOOL hook_lgToast(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgToast ? orig_lgToast(self, _cmd) : NO;
 }
 
 static BOOL (*orig_lgToastPeek)(id, SEL) = NULL;
 static BOOL hook_lgToastPeek(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgToastPeek ? orig_lgToastPeek(self, _cmd) : NO;
 }
 
 static BOOL (*orig_lgAlertDialog)(id, SEL) = NULL;
 static BOOL hook_lgAlertDialog(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgAlertDialog ? orig_lgAlertDialog(self, _cmd) : NO;
 }
 
 static BOOL (*orig_lgIconBar)(id, SEL) = NULL;
 static BOOL hook_lgIconBar(id self, SEL _cmd) {
+    if (!theta_osSupportsLiquidGlass()) return NO;
     if (ENABLED(@"Enable Liquid Glass Surfaces")) return YES;
     return orig_lgIconBar ? orig_lgIconBar(self, _cmd) : NO;
 }
 
 // ── Floating glass tab bar: C symbols via MSHookFunction ─
 // fishhook rebind_symbols corrupts FBSharedFramework GOT; Substrate hooks the real fn.
+//
+// IG 444+: these take the launcher set in x0 (IGFloatingTabBarEnabled forwards it to
+// IGTabBarStyleForLauncherSet, which objc_retains it). A BOOL(void) hook clobbers x0
+// while reading prefs, then tail-calls orig → SIGSEGV in objc_retain. Extra unused x0
+// is harmless if an older binary still uses a no-arg signature.
 
-static BOOL (*orig_IGFloatingTabBarEnabled)(void) = NULL;
-static BOOL (*orig_IGTabBarDynamicSizingEnabled)(void) = NULL;
-static BOOL (*orig_IGTabBarEnhancedDynamicSizingEnabled)(void) = NULL;
-static BOOL (*orig_IGTabBarHomecomingWithFloatingTabEnabled)(void) = NULL;
-static BOOL (*orig_IGTabBarViewPointFixEnabled)(void) = NULL;
-static NSInteger (*orig_IGTabBarStyleForLauncherSet)(NSInteger) = NULL;
+static BOOL (*orig_IGFloatingTabBarEnabled)(id) = NULL;
+static BOOL (*orig_IGTabBarDynamicSizingEnabled)(id) = NULL;
+static BOOL (*orig_IGTabBarEnhancedDynamicSizingEnabled)(id) = NULL;
+static BOOL (*orig_IGTabBarHomecomingWithFloatingTabEnabled)(id) = NULL;
+static BOOL (*orig_IGTabBarViewPointFixEnabled)(id) = NULL;
+static NSInteger (*orig_IGTabBarStyleForLauncherSet)(id) = NULL;
 
-static BOOL hook_IGFloatingTabBarEnabled(void) {
+static BOOL hook_IGFloatingTabBarEnabled(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return YES;
-    return orig_IGFloatingTabBarEnabled ? orig_IGFloatingTabBarEnabled() : NO;
+    return orig_IGFloatingTabBarEnabled ? orig_IGFloatingTabBarEnabled(launcherSet) : NO;
 }
-static BOOL hook_IGTabBarDynamicSizingEnabled(void) {
+static BOOL hook_IGTabBarDynamicSizingEnabled(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return YES;
-    return orig_IGTabBarDynamicSizingEnabled ? orig_IGTabBarDynamicSizingEnabled() : NO;
+    return orig_IGTabBarDynamicSizingEnabled ? orig_IGTabBarDynamicSizingEnabled(launcherSet) : NO;
 }
-static BOOL hook_IGTabBarEnhancedDynamicSizingEnabled(void) {
+static BOOL hook_IGTabBarEnhancedDynamicSizingEnabled(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return YES;
-    return orig_IGTabBarEnhancedDynamicSizingEnabled ? orig_IGTabBarEnhancedDynamicSizingEnabled() : NO;
+    return orig_IGTabBarEnhancedDynamicSizingEnabled ? orig_IGTabBarEnhancedDynamicSizingEnabled(launcherSet) : NO;
 }
-static BOOL hook_IGTabBarHomecomingWithFloatingTabEnabled(void) {
+static BOOL hook_IGTabBarHomecomingWithFloatingTabEnabled(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return YES;
-    return orig_IGTabBarHomecomingWithFloatingTabEnabled ? orig_IGTabBarHomecomingWithFloatingTabEnabled() : NO;
+    return orig_IGTabBarHomecomingWithFloatingTabEnabled ? orig_IGTabBarHomecomingWithFloatingTabEnabled(launcherSet) : NO;
 }
-static BOOL hook_IGTabBarViewPointFixEnabled(void) {
+static BOOL hook_IGTabBarViewPointFixEnabled(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return YES;
-    return orig_IGTabBarViewPointFixEnabled ? orig_IGTabBarViewPointFixEnabled() : NO;
+    return orig_IGTabBarViewPointFixEnabled ? orig_IGTabBarViewPointFixEnabled(launcherSet) : NO;
 }
-static NSInteger hook_IGTabBarStyleForLauncherSet(NSInteger set) {
+static NSInteger hook_IGTabBarStyleForLauncherSet(id launcherSet) {
     if (theta_liquidGlassSurfacesWanted()) return 1;
-    return orig_IGTabBarStyleForLauncherSet ? orig_IGTabBarStyleForLauncherSet(set) : set;
+    return orig_IGTabBarStyleForLauncherSet ? orig_IGTabBarStyleForLauncherSet(launcherSet) : 0;
 }
 
 static BOOL theta_tryInstallLiquidGlassTabBarCSymbolHooks(void) {
@@ -234,39 +257,22 @@ static Class theta_resolveIGNavConfigurationClass(void) {
     if (cached) return cached;
 
     NSArray *mangledAttempts = @[
+        @"IGNavConfiguration",
         @"_TtC18IGNavConfiguration18IGNavConfiguration",
         @"_TtC19IGNavConfiguration19IGNavConfiguration",
         @"_TtC20IGNavConfiguration20IGNavConfiguration",
         @"_TtC17IGNavConfiguration17IGNavConfiguration",
+        @"_TtC21IGNavConfiguration21IGNavConfiguration",
+        @"_TtC16IGNavConfiguration16IGNavConfiguration",
     ];
+    SEL isHC = NSSelectorFromString(@"isHomecomingEnabled");
     for (NSString *n in mangledAttempts) {
         Class c = NSClassFromString(n);
-        if (c) {
+        if (c && class_getInstanceMethod(c, isHC)) {
             cached = c;
             return cached;
         }
     }
-
-    int numClasses = objc_getClassList(NULL, 0);
-    if (numClasses <= 0) return Nil;
-
-    Class *buf = (Class *)malloc((size_t)numClasses * sizeof(Class));
-    if (!buf) return Nil;
-    int got = objc_getClassList(buf, numClasses);
-
-    SEL isHC = NSSelectorFromString(@"isHomecomingEnabled");
-    for (int i = 0; i < got; i++) {
-        Class c = buf[i];
-        const char *raw = class_getName(c);
-        if (!raw || !strstr(raw, "IGNavConfiguration")) continue;
-        if (class_getInstanceMethod(c, isHC)) {
-            cached = c;
-            free(buf);
-            return cached;
-        }
-    }
-
-    free(buf);
     return Nil;
 }
 

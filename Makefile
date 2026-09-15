@@ -53,11 +53,21 @@ ifeq ($(SIDELOAD), 1)
 	CODESIGN_IPA = 0
 	TARGET_CODESIGN =
 	LDID_FLAGS =
+	# dsymutil writes a same-named MH_DSYM under *.dSYM/; do not emit it for sideload.
+	TARGET_DSYMUTIL =
 else
 	Theta_CFLAGS += -DTHETA_PROJECT='"theta v$(THEOS_PACKAGE_BASE_VERSION)"'
 endif
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+ifeq ($(SIDELOAD),1)
+LIBRARY_NAME = ThetaNSE
+ThetaNSE_FILES = Source/SideloadNSE/ThetaNSE.m Source/SideloadNSE/ThetaHPKEKeyFile.m fishhook.c
+ThetaNSE_FRAMEWORKS = Foundation Security
+ThetaNSE_CFLAGS = -fobjc-arc -fvisibility=hidden -I$(THEOS_PROJECT_DIR)
+include $(THEOS_MAKE_PATH)/library.mk
+endif
 
 before-all::
 	@rm -f TweakCOMPILE.xm

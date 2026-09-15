@@ -1402,22 +1402,6 @@ static void ThetaHookShouldUpdateLastSeen(void) {
 			return;
 		}
 	}
-	int n = objc_getClassList(NULL, 0);
-	if (n <= 0) return;
-	Class *classes = (Class *)malloc((size_t)n * sizeof(Class));
-	n = objc_getClassList(classes, n);
-	for (int i = 0; i < n; i++) {
-		if (!class_getInstanceMethod(classes[i], sel)) continue;
-		const char *cname = class_getName(classes[i]);
-		if (!cname || !strstr(cname, "Direct")) continue;
-		Class supercls = class_getSuperclass(classes[i]);
-		Method mine = class_getInstanceMethod(classes[i], sel);
-		Method inherited = supercls ? class_getInstanceMethod(supercls, sel) : NULL;
-		if (inherited == mine) continue;
-		NullHookMessageIfPresent(classes[i], sel, (void *)hook_markMessagesAsSeen, &orig_markMessagesAsSeen);
-		break;
-	}
-	free(classes);
 }
 
 void THRegisterMarkAsSeenThreadAndReactionHooks(void) {

@@ -1,4 +1,5 @@
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 extern void THStorySeenReceiptNetworkGuardEnter(void);
 extern void THStorySeenReceiptNetworkGuardEnterWithContext(id fullscreenSectionController, id storyViewer);
@@ -10,6 +11,20 @@ static void downloadHDVideo(IGVideo *inputVideo);
 static UIImage *thetaColoredSystemSymbol(NSString *name, UIColor *color);
 
 static const NSInteger kThetaStoryButtonTag = 77001;
+
+static void (*orig_storyGhost2)(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen);
+static void (*orig_storyGhost3)(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen, NSInteger entryPoint);
+static void (*orig_sectionMarkCurrent)(id self, SEL _cmd);
+static void (*orig_sectionMarkItem)(id self, SEL _cmd, id item);
+
+static void hook_storyGhost2(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen);
+static void hook_storyGhost3(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen, NSInteger entryPoint);
+static void hook_sectionMarkCurrent(id self, SEL _cmd);
+static void hook_sectionMarkItem(id self, SEL _cmd, id item);
+static BOOL thetaLooksLikeStorySection(id obj);
+static BOOL thetaStoryObjectIsJunkSection(id obj);
+static id thetaStorySectionFromListAdapter(id adapter, UICollectionViewCell *cell);
+static id thetaStoryListAdapterFromHost(id host);
 
 static char kThetaBtnTouchUpInsideBlockKey;
 static char kThetaBtnTouchDownBlockKey;
@@ -82,78 +97,561 @@ static void thetaStorySkipIfEnabled(id firstDelegate) {
 
 static id thetaStorySectionControllerFromCell(IGStoryFullscreenCell *cell) {
     if (!cell) return nil;
-    id section = nil;
+    NSMutableArray *cands = [NSMutableArray array];
+    void (^add)(id) = ^(id obj) {
+        if (!obj) return;
+        if ([cands indexOfObjectIdenticalTo:obj] != NSNotFound) return;
+        [cands addObject:obj];
+    };
     @try {
         if ([cell respondsToSelector:@selector(delegate)]) {
-            section = [cell performSelector:@selector(delegate)];
+            add([cell performSelector:@selector(delegate)]);
         }
     } @catch (__unused NSException *e) {}
-    if (!section) {
-        id container = ThetaValueForKey(cell, @"containerView");
-        section = ThetaValueForKey(container, @"delegate");
+    id container = ThetaValueForKey(cell, @"containerView");
+    add(ThetaValueForKey(container, @"delegate"));
+    id overlay = ThetaValueForKey(cell, @"overlayView") ?: ThetaValueForKey(cell, @"_overlayView");
+    add(ThetaValueForKey(overlay, @"delegate"));
+    for (id c in cands) {
+        if (thetaLooksLikeStorySection(c)) return c;
     }
-    return section;
+    for (id c in cands) {
+        if (!thetaStoryObjectIsJunkSection(c)) return c;
+    }
+    return nil;
+}
+
+static BOOL thetaIsStoryViewerObject(id obj) {
+    if (!obj) return NO;
+    Class exact = NSClassFromString(@"IGStoryViewerViewController");
+    if (exact && [obj isKindOfClass:exact]) return YES;
+    NSString *name = NSStringFromClass(object_getClass(obj));
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    if ([name containsString:@"StoryViewerViewController"]) return YES;
+    if ([name containsString:@"StoryViewer"] && [name containsString:@"Controller"]) return YES;
+    if ([name isEqualToString:@"IGStoryViewerViewController"]) return YES;
+    return NO;
 }
 
 static id thetaStoryViewerFromCell(IGStoryFullscreenCell *cell) {
-    Class viewerCls = NSClassFromString(@"IGStoryViewerViewController");
-    if (!viewerCls) return nil;
-
     id section = thetaStorySectionControllerFromCell(cell);
     id candidate = ThetaValueForKey(section, @"delegate");
-    if ([candidate isKindOfClass:viewerCls]) return candidate;
+    if (thetaIsStoryViewerObject(candidate)) return candidate;
 
-    // Responder / superview walk — section.delegate is not always the viewer on newer IG.
     UIView *view = (UIView *)cell;
     while (view) {
         UIResponder *r = view.nextResponder;
         while (r) {
-            if ([r isKindOfClass:viewerCls]) return r;
+            if (thetaIsStoryViewerObject(r)) return r;
             r = r.nextResponder;
         }
         view = view.superview;
     }
 
-    for (NSString *key in @[ @"storyViewer", @"viewController", @"parentViewController", @"delegate" ]) {
+    for (NSString *key in @[ @"storyViewer", @"viewController", @"parentViewController", @"delegate", @"viewerViewController" ]) {
         id fromKey = ThetaValueForKey(section, key);
-        if ([fromKey isKindOfClass:viewerCls]) return fromKey;
+        if (thetaIsStoryViewerObject(fromKey)) return fromKey;
     }
 
-    // Presented / top VC fallback
     @try {
         UIViewController *top = [ThetaHelper topViewController];
         UIViewController *p = top;
         while (p) {
-            if ([p isKindOfClass:viewerCls]) return p;
+            if (thetaIsStoryViewerObject(p)) return p;
             p = p.parentViewController;
         }
         p = top;
         while (p) {
-            if ([p isKindOfClass:viewerCls]) return p;
+            if (thetaIsStoryViewerObject(p)) return p;
             p = p.presentingViewController;
         }
     } @catch (__unused NSException *e) {}
 
-    return nil; // never return a non-viewer object
+    if (candidate) return candidate;
+    return nil;
+}
+
+static id thetaStoryPreferredSection(IGStoryFullscreenCell *cell, id viewer) {
+    NSMutableArray *cands = [NSMutableArray array];
+    void (^add)(id) = ^(id obj) {
+        if (!obj || thetaStoryObjectIsJunkSection(obj)) return;
+        if ([cands indexOfObjectIdenticalTo:obj] != NSNotFound) return;
+        [cands addObject:obj];
+    };
+    add(thetaStorySectionControllerFromCell(cell));
+    if (viewer) {
+        for (NSString *selName in @[
+            @"_getMostVisibleSectionController",
+            @"mostVisibleSectionController",
+            @"currentSectionController",
+            @"focusedSectionController",
+            @"visibleSectionController"
+        ]) {
+            SEL s = NSSelectorFromString(selName);
+            if (!class_getInstanceMethod(object_getClass(viewer), s)) continue;
+            id vis = nil;
+            @try { vis = ((id (*)(id, SEL))objc_msgSend)(viewer, s); } @catch (__unused NSException *e) {}
+            add(vis);
+        }
+        for (NSString *key in @[ @"currentSectionController", @"focusedSectionController", @"visibleSectionController" ]) {
+            add(ThetaValueForKey(viewer, key));
+        }
+        id adapter = thetaStoryListAdapterFromHost(viewer);
+        add(thetaStorySectionFromListAdapter(adapter, (UICollectionViewCell *)cell));
+    }
+    if ([cell isKindOfClass:[UICollectionViewCell class]]) {
+        UIView *v = ((UIView *)cell).superview;
+        while (v && ![v isKindOfClass:[UICollectionView class]]) v = v.superview;
+        if ([v isKindOfClass:[UICollectionView class]]) {
+            id adapter = ThetaValueForKey(v, @"delegate");
+            NSString *an = adapter ? NSStringFromClass([adapter class]) : nil;
+            if (![an containsString:@"ListAdapter"]) adapter = ThetaValueForKey(v, @"dataSource");
+            an = adapter ? NSStringFromClass([adapter class]) : nil;
+            if (![an containsString:@"ListAdapter"]) adapter = nil;
+            add(thetaStorySectionFromListAdapter(adapter, (UICollectionViewCell *)cell));
+        }
+    }
+    for (id c in cands) {
+        if (thetaLooksLikeStorySection(c)) return c;
+    }
+    return nil;
+}
+
+static id thetaStoryCurrentItem(id section, id viewer) {
+    NSArray *hosts = viewer && section ? @[section, viewer] : (section ? @[section] : (viewer ? @[viewer] : @[]));
+    NSArray *selNames = @[ @"currentStoryItem", @"currentItem", @"focusedStoryItem", @"currentReelItem", @"focusedItem", @"storyItem" ];
+    NSArray *keys = @[ @"currentStoryItem", @"currentItem", @"focusedStoryItem", @"currentReelItem", @"storyItem", @"media" ];
+    for (id host in hosts) {
+        for (NSString *selName in selNames) {
+            SEL s = NSSelectorFromString(selName);
+            if (!class_getInstanceMethod(object_getClass(host), s)) continue;
+            id v = nil;
+            @try { v = ((id (*)(id, SEL))objc_msgSend)(host, s); } @catch (__unused NSException *e) {}
+            if (v) return v;
+        }
+        for (NSString *key in keys) {
+            id v = ThetaValueForKey(host, key);
+            if (v) return v;
+        }
+    }
+    return nil;
+}
+
+static BOOL thetaLooksLikeStorySection(id obj) {
+    if (!obj) return NO;
+    NSString *n = NSStringFromClass(object_getClass(obj));
+    if (![n isKindOfClass:[NSString class]]) return NO;
+    NSString *l = n.lowercaseString;
+    if ([l containsString:@"nux"] || [l containsString:@"dismisshandler"] || [l containsString:@"gesture"]) return NO;
+    if ([l containsString:@"overlay"] || [l containsString:@"footer"] || [l containsString:@"header"]) return NO;
+    if ([n containsString:@"StoryFullscreenSectionController"]) return YES;
+    if ([n containsString:@"FullscreenSectionController"]) return YES;
+    if ([n containsString:@"StorySectionController"]) return YES;
+    if ([n containsString:@"SectionController"]
+        && class_getInstanceMethod(object_getClass(obj), @selector(currentStoryItem))) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL thetaStoryObjectIsJunkSection(id obj) {
+    if (!obj) return YES;
+    NSString *n = NSStringFromClass(object_getClass(obj));
+    if (![n isKindOfClass:[NSString class]]) return YES;
+    NSString *l = n.lowercaseString;
+    if ([l containsString:@"nux"] || [l containsString:@"dismisshandler"]) return YES;
+    if (thetaIsStoryViewerObject(obj)) return YES;
+    return NO;
+}
+
+static id thetaStoryObjectIvar(id obj, const char *name) {
+    if (!obj || !name) return nil;
+    for (Class cls = object_getClass(obj); cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        Ivar iv = class_getInstanceVariable(cls, name);
+        if (!iv) continue;
+        const char *enc = ivar_getTypeEncoding(iv);
+        if (!enc || enc[0] != '@') return nil;
+        id val = nil;
+        @try { val = object_getIvar(obj, iv); } @catch (__unused NSException *e) {}
+        return val;
+    }
+    return nil;
+}
+
+static id thetaStoryListAdapterFromHost(id host) {
+    if (!host) return nil;
+    for (NSString *key in @[ @"listAdapter", @"_listAdapter", @"adapter" ]) {
+        id a = ThetaValueForKey(host, key);
+        NSString *n = a ? NSStringFromClass([a class]) : nil;
+        if ([n containsString:@"ListAdapter"]) return a;
+    }
+    id a = thetaStoryObjectIvar(host, "_listAdapter") ?: thetaStoryObjectIvar(host, "listAdapter");
+    NSString *n = a ? NSStringFromClass([a class]) : nil;
+    if ([n containsString:@"ListAdapter"]) return a;
+    return nil;
+}
+
+static id thetaStorySectionFromListAdapter(id adapter, UICollectionViewCell *cell) {
+    if (!adapter) return nil;
+    NSArray *vis = nil;
+    SEL visSel = NSSelectorFromString(@"visibleSectionControllers");
+    if (class_getInstanceMethod(object_getClass(adapter), visSel)) {
+        @try { vis = ((id (*)(id, SEL))objc_msgSend)(adapter, visSel); } @catch (__unused NSException *e) {}
+        if ([vis isKindOfClass:[NSArray class]]) {
+            for (id sc in vis) {
+                if (thetaLooksLikeStorySection(sc)) return sc;
+            }
+        }
+    }
+    UICollectionView *cv = nil;
+    if ([cell isKindOfClass:[UICollectionViewCell class]]) {
+        UIView *v = cell.superview;
+        while (v && ![v isKindOfClass:[UICollectionView class]]) v = v.superview;
+        cv = (UICollectionView *)v;
+    }
+    NSIndexPath *ip = (cv && cell) ? [cv indexPathForCell:cell] : nil;
+    if (ip) {
+        for (NSString *name in @[ @"sectionControllerForSection:", @"sectionControllerForSectionIndex:" ]) {
+            SEL s = NSSelectorFromString(name);
+            if (!class_getInstanceMethod(object_getClass(adapter), s)) continue;
+            id sc = nil;
+            @try { sc = ((id (*)(id, SEL, NSInteger))objc_msgSend)(adapter, s, ip.section); } @catch (__unused NSException *e) {}
+            if (thetaLooksLikeStorySection(sc)) return sc;
+        }
+        SEL objSel = NSSelectorFromString(@"objectForSection:");
+        SEL scSel = NSSelectorFromString(@"sectionControllerForObject:");
+        if (class_getInstanceMethod(object_getClass(adapter), objSel) && class_getInstanceMethod(object_getClass(adapter), scSel)) {
+            id obj = nil;
+            @try { obj = ((id (*)(id, SEL, NSInteger))objc_msgSend)(adapter, objSel, ip.section); } @catch (__unused NSException *e) {}
+            if (obj) {
+                id sc = nil;
+                @try { sc = ((id (*)(id, SEL, id))objc_msgSend)(adapter, scSel, obj); } @catch (__unused NSException *e) {}
+                if (thetaLooksLikeStorySection(sc)) return sc;
+            }
+        }
+    }
+    NSArray *objects = nil;
+    SEL objectsSel = NSSelectorFromString(@"objects");
+    SEL scForObj = NSSelectorFromString(@"sectionControllerForObject:");
+    if (class_getInstanceMethod(object_getClass(adapter), objectsSel)
+        && class_getInstanceMethod(object_getClass(adapter), scForObj)) {
+        @try { objects = ((id (*)(id, SEL))objc_msgSend)(adapter, objectsSel); } @catch (__unused NSException *e) {}
+        if ([objects isKindOfClass:[NSArray class]]) {
+            id preferred = nil;
+            if (ip && ip.section >= 0 && ip.section < (NSInteger)objects.count) {
+                id obj = objects[(NSUInteger)ip.section];
+                @try { preferred = ((id (*)(id, SEL, id))objc_msgSend)(adapter, scForObj, obj); } @catch (__unused NSException *e) {}
+                if (thetaLooksLikeStorySection(preferred)) return preferred;
+            }
+            for (id obj in objects) {
+                id sc = nil;
+                @try { sc = ((id (*)(id, SEL, id))objc_msgSend)(adapter, scForObj, obj); } @catch (__unused NSException *e) {}
+                if (thetaLooksLikeStorySection(sc)) {
+                    if (!preferred) preferred = sc;
+                }
+            }
+            if (preferred) return preferred;
+        }
+    }
+    return nil;
+}
+
+static void thetaStoryAddUnique(NSMutableArray *into, id obj) {
+    if (!obj || !into) return;
+    if ([into indexOfObjectIdenticalTo:obj] != NSNotFound) return;
+    [into addObject:obj];
+}
+
+static BOOL thetaStoryHasSelector(id obj, SEL sel) {
+    if (!obj || !sel) return NO;
+    return class_getInstanceMethod(object_getClass(obj), sel) != NULL;
+}
+
+static BOOL thetaStorySelLooksLikeMarkSeen(NSString *name) {
+    if (!name.length) return NO;
+    NSString *l = name.lowercaseString;
+    if ([l hasPrefix:@"is"] || [l hasPrefix:@"has"] || [l hasPrefix:@"get"] || [l hasPrefix:@"set"]) return NO;
+    if ([l containsString:@"didmarkitemasseen"]) return YES;
+    if ([l containsString:@"markitemasseen"]) return YES;
+    if ([l containsString:@"markcurrentitemasseen"]) return YES;
+    if ([l containsString:@"markstoryitemasseen"]) return YES;
+    if ([l containsString:@"markitemseen"]) return YES;
+    if ([l containsString:@"didmarkasseen"]) return YES;
+    if ([l containsString:@"sendseenrequest"]) return YES;
+    if ([l containsString:@"enqueueseenrequest"]) return YES;
+    return NO;
+}
+
+static BOOL thetaStorySignatureSafeToInvoke(NSMethodSignature *sig) {
+    if (!sig) return NO;
+    NSUInteger n = sig.numberOfArguments;
+    if (n > 6) return NO;
+    for (NSUInteger i = 2; i < n; i++) {
+        const char *t = [sig getArgumentTypeAtIndex:i];
+        if (!t) return NO;
+        while (*t == 'r' || *t == 'n' || *t == 'N' || *t == 'o' || *t == 'O' || *t == 'V') t++;
+        char c = *t;
+        if (c == '@' || c == '#' || c == ':' || c == 'B' || c == 'c' || c == 'C' || c == 's' || c == 'S'
+            || c == 'i' || c == 'I' || c == 'l' || c == 'L' || c == 'q' || c == 'Q' || c == 'f' || c == 'd') {
+            continue;
+        }
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL thetaStoryInvokeSeenSelector(id target, SEL sel, id section, id item) {
+    if (!target || !sel || !thetaStoryHasSelector(target, sel)) return NO;
+
+    IMP live = method_getImplementation(class_getInstanceMethod(object_getClass(target), sel));
+    if (live == (IMP)hook_storyGhost2 && orig_storyGhost2) {
+        @try {
+            orig_storyGhost2(target, sel, section, item);
+            return YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig2 %@ threw %@", NSStringFromSelector(sel), e);
+            return NO;
+        }
+    }
+    if (live == (IMP)hook_storyGhost3 && orig_storyGhost3) {
+        @try {
+            orig_storyGhost3(target, sel, section, item, 0);
+            return YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig3 %@ threw %@", NSStringFromSelector(sel), e);
+            return NO;
+        }
+    }
+    if (live == (IMP)hook_sectionMarkCurrent && orig_sectionMarkCurrent) {
+        @try {
+            orig_sectionMarkCurrent(target, sel);
+            return YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig markCurrent %@ threw %@", NSStringFromSelector(sel), e);
+            return NO;
+        }
+    }
+    if (live == (IMP)hook_sectionMarkItem && orig_sectionMarkItem) {
+        @try {
+            orig_sectionMarkItem(target, sel, item);
+            return YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig markItem %@ threw %@", NSStringFromSelector(sel), e);
+            return NO;
+        }
+    }
+
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig) {
+        NSUInteger colons = [[NSStringFromSelector(sel) componentsSeparatedByString:@":"] count] - 1;
+        @try {
+            if (colons == 0) {
+                ((void (*)(id, SEL))objc_msgSend)(target, sel);
+                return YES;
+            }
+            if (colons == 1) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, sel, item);
+                return YES;
+            }
+            if (colons == 2) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(target, sel, section ?: item, item);
+                return YES;
+            }
+            if (colons == 3) {
+                ((void (*)(id, SEL, id, id, NSInteger))objc_msgSend)(target, sel, section, item, 0);
+                return YES;
+            }
+        } @catch (__unused NSException *e) {}
+        return NO;
+    }
+    if (!thetaStorySignatureSafeToInvoke(sig)) return NO;
+
+    NSString *name = NSStringFromSelector(sel);
+    BOOL sectionFirst = [name containsString:@"SectionController:"] || [name containsString:@"sectionController:"];
+    id objArgs[3] = { sectionFirst ? section : item, sectionFirst ? item : section, nil };
+    NSInteger zero = 0;
+    NSUInteger objIdx = 0;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:target];
+    [inv setSelector:sel];
+    for (NSUInteger i = 2; i < sig.numberOfArguments; i++) {
+        const char *t = [sig getArgumentTypeAtIndex:i];
+        while (t && (*t == 'r' || *t == 'n' || *t == 'N' || *t == 'o' || *t == 'O' || *t == 'V')) t++;
+        if (!t) continue;
+        if (*t == '@' || *t == '#') {
+            id a = (objIdx < 3) ? objArgs[objIdx] : nil;
+            objIdx++;
+            [inv setArgument:&a atIndex:i];
+        } else if (*t == 'f') {
+            float z = 0;
+            [inv setArgument:&z atIndex:i];
+        } else if (*t == 'd') {
+            double z = 0;
+            [inv setArgument:&z atIndex:i];
+        } else {
+            [inv setArgument:&zero atIndex:i];
+        }
+    }
+    @try {
+        [inv invoke];
+        return YES;
+    } @catch (NSException *e) {
+        NSLog(@"[Theta] StoryGhost: %@ on %@ threw %@", name, NSStringFromClass([target class]), e);
+        return NO;
+    }
+}
+
+static NSArray<NSString *> *thetaStoryMarkSeenSelectorNamesOn(id obj) {
+    if (!obj) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (Class cls = object_getClass(obj); cls && cls != [NSObject class]; cls = class_getSuperclass(cls)) {
+        unsigned n = 0;
+        Method *list = class_copyMethodList(cls, &n);
+        if (list) {
+            for (unsigned i = 0; i < n; i++) {
+                NSString *name = NSStringFromSelector(method_getName(list[i]));
+                if (!thetaStorySelLooksLikeMarkSeen(name) || [seen containsObject:name]) continue;
+                [seen addObject:name];
+                [out addObject:name];
+            }
+            free(list);
+        }
+        if (cls == [UIViewController class] || cls == [UIView class]) break;
+    }
+    return out;
 }
 
 static BOOL thetaStoryMarkItemAsSeen(IGStoryFullscreenCell *cell, id item) {
     if (!cell || !item) return NO;
-    id section = thetaStorySectionControllerFromCell(cell);
     id viewer = thetaStoryViewerFromCell(cell);
-    Class viewerCls = NSClassFromString(@"IGStoryViewerViewController");
-    SEL sel = @selector(fullscreenSectionController:didMarkItemAsSeen:);
-    if (!viewer || (viewerCls && ![viewer isKindOfClass:viewerCls]) || ![viewer respondsToSelector:sel]) {
-        NSLog(@"[Theta] StoryGhost: no viewer for didMarkItemAsSeen (viewer=%@)", NSStringFromClass([viewer class]));
+    id section = thetaStoryPreferredSection(cell, viewer);
+    if (thetaStoryObjectIsJunkSection(section) || !thetaLooksLikeStorySection(section))
+        section = nil;
+
+    NSMutableArray *targets = [NSMutableArray array];
+    thetaStoryAddUnique(targets, viewer);
+    if (section) {
+        id secDel = ThetaValueForKey(section, @"delegate");
+        if (!thetaStoryObjectIsJunkSection(secDel) || thetaIsStoryViewerObject(secDel))
+            thetaStoryAddUnique(targets, secDel);
+        thetaStoryAddUnique(targets, section);
+    }
+
+    if (targets.count == 0) {
+        NSLog(@"[Theta] StoryGhost: no viewer/section for mark-seen");
         return NO;
     }
-    @try {
-        ((void (*)(id, SEL, id, id))objc_msgSend)(viewer, sel, section, item);
-        return YES;
-    } @catch (NSException *e) {
-        NSLog(@"[Theta] StoryGhost: didMarkItemAsSeen threw %@", e);
+    if (!section) {
+        NSLog(@"[Theta] StoryGhost: fullscreen section missing (viewer=%@ cellDel=%@)",
+              NSStringFromClass([viewer class]),
+              NSStringFromClass([ThetaValueForKey(cell, @"delegate") class]));
         return NO;
     }
+
+    static NSArray<NSString *> *kKnownViewerSels;
+    static NSArray<NSString *> *kKnownSectionItemSels;
+    static NSArray<NSString *> *kKnownSectionVoidSels;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        kKnownViewerSels = @[
+            @"fullscreenSectionController:didMarkItemAsSeen:",
+            @"fullscreenSectionController:didMarkItemAsSeen:entryPoint:",
+            @"fullscreenSectionController:didMarkItemAsSeen:source:",
+            @"fullscreenSectionController:didMarkItemAsSeen:entryPoint:source:",
+            @"storySectionController:didMarkItemAsSeen:",
+            @"sectionController:didMarkItemAsSeen:",
+            @"fullscreenSectionController:didEndViewingItem:"
+        ];
+        kKnownSectionItemSels = @[
+            @"markItemAsSeen:",
+            @"_markItemAsSeen:",
+            @"markStoryItemAsSeen:",
+            @"markCurrentItemAsSeen:",
+            @"_markCurrentItemAsSeen:"
+        ];
+        kKnownSectionVoidSels = @[
+            @"markCurrentItemAsSeen",
+            @"_markCurrentItemAsSeen",
+            @"sendSeenRequestForCurrentItem",
+            @"_sendSeenRequestForCurrentItem"
+        ];
+    });
+
+    BOOL invoked = NO;
+
+    if (orig_storyGhost2 && viewer) {
+        @try {
+            orig_storyGhost2(viewer, @selector(fullscreenSectionController:didMarkItemAsSeen:), section, item);
+            invoked = YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig didMarkItemAsSeen threw %@", e);
+        }
+    }
+    if (orig_storyGhost3 && viewer) {
+        @try {
+            orig_storyGhost3(viewer, NSSelectorFromString(@"fullscreenSectionController:didMarkItemAsSeen:entryPoint:"), section, item, 0);
+            invoked = YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig didMarkItemAsSeen:entryPoint: threw %@", e);
+        }
+    }
+    if (orig_sectionMarkCurrent) {
+        @try {
+            orig_sectionMarkCurrent(section, NSSelectorFromString(@"markCurrentItemAsSeen"));
+            invoked = YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig markCurrentItemAsSeen threw %@", e);
+        }
+    }
+    if (orig_sectionMarkItem) {
+        @try {
+            orig_sectionMarkItem(section, NSSelectorFromString(@"markItemAsSeen:"), item);
+            invoked = YES;
+        } @catch (NSException *e) {
+            NSLog(@"[Theta] StoryGhost: orig markItemAsSeen: threw %@", e);
+        }
+    }
+
+    for (id target in targets) {
+        if (thetaStoryObjectIsJunkSection(target) && !thetaIsStoryViewerObject(target) && target != section)
+            continue;
+        for (NSString *name in kKnownViewerSels) {
+            invoked = thetaStoryInvokeSeenSelector(target, NSSelectorFromString(name), section, item) || invoked;
+        }
+        for (NSString *name in kKnownSectionItemSels) {
+            invoked = thetaStoryInvokeSeenSelector(target, NSSelectorFromString(name), section, item) || invoked;
+        }
+        for (NSString *name in kKnownSectionVoidSels) {
+            if (s_thetaLocalSeenMarkActive && [name.lowercaseString containsString:@"sendseen"]) continue;
+            invoked = thetaStoryInvokeSeenSelector(target, NSSelectorFromString(name), section, item) || invoked;
+        }
+        if (invoked) break;
+    }
+
+    if (!invoked) {
+        for (id target in targets) {
+            for (NSString *name in thetaStoryMarkSeenSelectorNamesOn(target)) {
+                if (s_thetaLocalSeenMarkActive && [name.lowercaseString containsString:@"sendseen"]) continue;
+                invoked = thetaStoryInvokeSeenSelector(target, NSSelectorFromString(name), section, item) || invoked;
+            }
+            if (invoked) break;
+        }
+    }
+
+    if (!invoked) {
+        NSMutableArray *clsNames = [NSMutableArray array];
+        for (id t in targets) {
+            NSString *cn = NSStringFromClass([t class]) ?: @"?";
+            [clsNames addObject:cn];
+            NSArray *sels = thetaStoryMarkSeenSelectorNamesOn(t);
+            if (sels.count)
+                NSLog(@"[Theta] StoryGhost: %@ mark-sels=%@", cn, [sels componentsJoinedByString:@","]);
+        }
+        NSLog(@"[Theta] StoryGhost: no mark-seen IMP targets=%@", [clsNames componentsJoinedByString:@","]);
+    }
+    return invoked;
 }
 
 static NSURL *thetaStoryURLFromCandidate(id cand) {
@@ -527,10 +1025,10 @@ static void downloadAllMedia(IGStoryFullscreenCell *self) {
 
 /// Mark as seen on this device only (`Seen Receipts Stay Local`). Tap = current item; long-press = every item in this reel.
 static void thetaLocalSeenResolveDelegates(IGStoryFullscreenCell *self, id *outFirst, id *outSecond) {
-    id firstDelegate = thetaStorySectionControllerFromCell(self);
-    id secondDelegate = thetaStoryViewerFromCell(self);
-    if (outFirst) *outFirst = firstDelegate;
-    if (outSecond) *outSecond = secondDelegate;
+    id viewer = thetaStoryViewerFromCell(self);
+    id section = thetaStoryPreferredSection(self, viewer);
+    if (outFirst) *outFirst = section;
+    if (outSecond) *outSecond = viewer;
 }
 
 /// Resolves NSArray of objects acceptable for `-fullscreenSectionController:didMarkItemAsSeen:` (often `IGStoryItem`, not bare `IGMedia`).
@@ -655,14 +1153,21 @@ static void thetaLocalSeenMarkCurrent(IGStoryFullscreenCell *self) {
         if ([firstDelegate respondsToSelector:@selector(currentStoryItem)])
             currentItem = [firstDelegate performSelector:@selector(currentStoryItem)];
     } @catch (__unused NSException *e) {}
+    if (!currentItem)
+        currentItem = thetaStoryCurrentItem(firstDelegate, secondDelegate);
     if (!currentItem) return;
 
     THStorySeenReceiptNetworkGuardEnterWithContext(firstDelegate, secondDelegate);
     BOOL ghostOn = ENABLED(@"Story Ghost");
+    s_thetaLocalSeenMarkActive = YES;
     if (ghostOn) shouldBeSeen = YES;
     BOOL ok = thetaStoryMarkItemAsSeen(self, currentItem);
     if (ghostOn) shouldBeSeen = NO;
-    THStorySeenReceiptNetworkGuardLeave();
+    THStorySeenReceiptNetworkGuardResealAfterMark(firstDelegate, secondDelegate);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        s_thetaLocalSeenMarkActive = NO;
+        THStorySeenReceiptNetworkGuardLeave();
+    });
 
     if (ENABLED(@"Show Banners")) {
         if (ok) {
@@ -698,6 +1203,7 @@ static void thetaLocalSeenMarkAll(IGStoryFullscreenCell *self) {
 
     THStorySeenReceiptNetworkGuardEnterWithContext(firstDelegate, secondDelegate);
     BOOL ghostOn = ENABLED(@"Story Ghost");
+    s_thetaLocalSeenMarkActive = YES;
     if (ghostOn) shouldBeSeen = YES;
     @try {
         for (id item in items) {
@@ -712,7 +1218,11 @@ static void thetaLocalSeenMarkAll(IGStoryFullscreenCell *self) {
         }
     } @catch (__unused NSException *e) {}
     if (ghostOn) shouldBeSeen = NO;
-    THStorySeenReceiptNetworkGuardLeave();
+    THStorySeenReceiptNetworkGuardResealAfterMark(firstDelegate, secondDelegate);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        s_thetaLocalSeenMarkActive = NO;
+        THStorySeenReceiptNetworkGuardLeave();
+    });
 
     if (priorFocused) {
         @try {
@@ -743,8 +1253,9 @@ static void handleLocalSeenLongPress(IGStoryFullscreenCell *self, UILongPressGes
 }
 
 static void seenButtonPressedAll(IGStoryFullscreenCell *self) {
-    id firstDelegate = thetaStorySectionControllerFromCell(self);
-    id secondDelegate = thetaStoryViewerFromCell(self);
+    id viewer = thetaStoryViewerFromCell(self);
+    id firstDelegate = thetaStoryPreferredSection(self, viewer);
+    id secondDelegate = viewer;
     if (!firstDelegate || !secondDelegate) return;
 
     NSArray *items = theta_storyResolvedItemsForMarkAll(firstDelegate, secondDelegate);
@@ -756,7 +1267,10 @@ static void seenButtonPressedAll(IGStoryFullscreenCell *self) {
 
     for (id item in items) {
         shouldBeSeen = true;
+        s_thetaAllowStorySeenReceipts = YES;
         (void)thetaStoryMarkItemAsSeen(self, item);
+        s_thetaAllowStorySeenReceipts = NO;
+        shouldBeSeen = false;
     }
 
     if (ENABLED(@"Show Banners")) {
@@ -767,34 +1281,21 @@ static void seenButtonPressedAll(IGStoryFullscreenCell *self) {
 }
 
 static void seenButtonPressedCurrent(IGStoryFullscreenCell *self) {
-    id firstDelegate = thetaStorySectionControllerFromCell(self);
-    if (!firstDelegate) {
+    id viewer = thetaStoryViewerFromCell(self);
+    id section = thetaStoryPreferredSection(self, viewer);
+    id currentItem = thetaStoryCurrentItem(section, viewer);
+    if (!currentItem) {
         if (ENABLED(@"Show Banners")) {
-            [ThetaHelper showToastWithTitle:@"Mark failed" subtitle:@"Story section not found." icon:[UIImage systemImageNamed:@"exclamationmark.triangle"] autoHide:3 openURL:nil];
+            [ThetaHelper showToastWithTitle:@"Mark failed" subtitle:@"Current story item not found." icon:[UIImage systemImageNamed:@"exclamationmark.triangle"] autoHide:3 openURL:nil];
         }
         return;
     }
 
-	id currentItem = nil;
-	@try {
-		if ([firstDelegate respondsToSelector:@selector(currentStoryItem)]) {
-			currentItem = [firstDelegate performSelector:@selector(currentStoryItem)];
-		}
-	} @catch (__unused NSException *e) {}
-    if (!currentItem) {
-        id viewer = thetaStoryViewerFromCell(self);
-        @try {
-            if ([viewer respondsToSelector:@selector(currentStoryItem)]) {
-                currentItem = [viewer performSelector:@selector(currentStoryItem)];
-            }
-        } @catch (__unused NSException *e) {}
-    }
-
-    BOOL ok = NO;
-	if (currentItem) {
-		shouldBeSeen = true;
-        ok = thetaStoryMarkItemAsSeen(self, currentItem);
-	}
+    shouldBeSeen = true;
+    s_thetaAllowStorySeenReceipts = YES;
+    BOOL ok = thetaStoryMarkItemAsSeen(self, currentItem);
+    s_thetaAllowStorySeenReceipts = NO;
+    shouldBeSeen = false;
 
 	if (ENABLED(@"Show Banners")) {
         if (ok) {
@@ -804,7 +1305,7 @@ static void seenButtonPressedCurrent(IGStoryFullscreenCell *self) {
         }
 	}
 
-	if (ok) thetaStorySkipIfEnabled(firstDelegate);
+	if (ok) thetaStorySkipIfEnabled(section ?: thetaStorySectionControllerFromCell(self));
 }
 
 static NSMutableDictionary *lastSetupOwnerForCell;
@@ -1060,40 +1561,96 @@ static void presentMentionsAlert(IGStoryFullscreenCell *self) {
     [ThetaHelper showCustomAlertWithActions:@"Story Mentions" description:@"Select a user to open their profile." actions:actions];
 }
 
+static Class theta_storyFullscreenCellClass(void) {
+    static Class cached = Nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cached = NSClassFromString(@"IGStoryFullscreenCell");
+        if (cached) return;
+        Class alt = NSClassFromString(@"IGStoryCell");
+        if (alt && [alt isSubclassOfClass:[UICollectionViewCell class]])
+            cached = alt;
+    });
+    return cached;
+}
+
+static UIView *thetaStoryOverlayHost(IGStoryFullscreenCell *cell) {
+    if (!cell) return nil;
+    for (NSString *key in @[ @"overlayView", @"_overlayView", @"fullscreenOverlayView", @"storyOverlayView" ]) {
+        id v = nil;
+        @try { v = [cell valueForKey:key]; } @catch (__unused NSException *e) {}
+        if ([v isKindOfClass:[UIView class]]) return v;
+    }
+    return (UIView *)cell;
+}
+
+static id thetaStoryViewModelFromSection(id section, IGStoryFullscreenCell *cell) {
+    for (NSString *key in @[ @"viewModel", @"currentViewModel", @"_viewModel", @"storyViewModel", @"reelViewModel" ]) {
+        id vm = ThetaValueForKey(section, key);
+        if (vm) return vm;
+    }
+    id viewer = thetaStoryViewerFromCell(cell);
+    for (NSString *key in @[ @"currentViewModel", @"viewModel" ]) {
+        id vm = ThetaValueForKey(viewer, key);
+        if (vm) return vm;
+    }
+    return nil;
+}
+
+static id thetaStoryOwnerFromViewModel(id viewModel) {
+    for (NSString *key in @[ @"owner", @"reelOwner", @"storyOwner", @"ownerUser", @"user", @"poster" ]) {
+        id o = ThetaValueForKey(viewModel, key);
+        if (o) return o;
+    }
+    return nil;
+}
+
+static BOOL thetaStoryViewHasTaggedButtons(UIView *view) {
+    if (!view) return NO;
+    for (UIView *sub in view.subviews) {
+        if (sub.tag == kThetaStoryButtonTag) return YES;
+    }
+    return NO;
+}
+
+static void thetaStoryRemoveTaggedButtonsFromView(UIView *view) {
+    if (!view) return;
+    for (UIView *sub in [view.subviews copy]) {
+        if (sub.tag == kThetaStoryButtonTag) [sub removeFromSuperview];
+    }
+}
+
 static void setupButtons(IGStoryFullscreenCell *self) {
-    id firstDelegate = nil;
+    static BOOL s_guard;
+    if (s_guard) return;
+    if (!self || ![(UIView *)self window]) return;
+    if (!(ENABLED(@"Save Media") || ENABLED(@"Story Ghost") || ENABLED(@"Seen Receipts Stay Local") || ENABLED(@"See Story Mentions"))) {
+        return;
+    }
+
+    s_guard = YES;
     @try {
-        if ([self respondsToSelector:@selector(delegate)]) {
-            firstDelegate = [self performSelector:@selector(delegate)];
-        } else if ([self respondsToSelector:@selector(valueForKey:)]) {
-            id container = [self valueForKey:@"containerView"];
-            if (container && [container respondsToSelector:@selector(valueForKey:)]) {
-                firstDelegate = [container valueForKey:@"delegate"];
-            }
-        }
-    } @catch (__unused NSException *e) {}
-    if (!firstDelegate) return;
-    id viewModel = nil;
-    @try { viewModel = [firstDelegate valueForKey:@"viewModel"]; } @catch (__unused NSException *e) {}
-    if (!viewModel) return;
-    IGUser *owner = nil;
-    @try { owner = [viewModel valueForKey:@"owner"]; } @catch (__unused NSException *e) {}
-    if (!owner) return;
+    id firstDelegate = thetaStorySectionControllerFromCell(self);
+    id viewModel = thetaStoryViewModelFromSection(firstDelegate, self);
+    IGUser *owner = thetaStoryOwnerFromViewModel(viewModel);
+
+    UIView *host = thetaStoryOverlayHost(self);
+    if (!host) host = (UIView *)self;
 
     NSNumber *cellKey = @((uintptr_t)self);
     NSString *ownerKey = thetaStoryOwnerKey(owner) ?: @"";
     NSString *lastOwnerKey = lastSetupOwnerForCell[cellKey];
-    if ([lastOwnerKey isKindOfClass:[NSString class]] && [lastOwnerKey isEqualToString:ownerKey] && ownerKey.length > 0) {
+    BOOL alreadyShown = thetaStoryViewHasTaggedButtons(host) || thetaStoryViewHasTaggedButtons((UIView *)self);
+    if (alreadyShown && [lastOwnerKey isKindOfClass:[NSString class]] && [lastOwnerKey isEqualToString:ownerKey]) {
+        for (UIView *button in host.subviews) {
+            if (button.tag == kThetaStoryButtonTag) [host bringSubviewToFront:button];
+        }
         return;
     }
     lastSetupOwnerForCell[cellKey] = ownerKey;
 
-    // Only remove Theta-owned controls — never strip Instagram's UIButtons.
-    for (UIView *subview in [self.subviews copy]) {
-        if ([subview isKindOfClass:[UIButton class]] && subview.tag == kThetaStoryButtonTag) {
-            [subview removeFromSuperview];
-        }
-    }
+    thetaStoryRemoveTaggedButtonsFromView((UIView *)self);
+    thetaStoryRemoveTaggedButtonsFromView(host);
 
     UIButton *downloadButton = [UIButton buttonWithType:UIButtonTypeSystem];
     downloadButton.tag = kThetaStoryButtonTag;
@@ -1240,16 +1797,17 @@ static void setupButtons(IGStoryFullscreenCell *self) {
     UIButton *previousButton = nil;
     for (UIButton *button in buttonStack) {
         ThetaSetCaptureHiding(button);
-        [self addSubview:button];
+        [host addSubview:button];
+        [host bringSubviewToFront:button];
         [NSLayoutConstraint activateConstraints:@[
-            [button.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-8],
+            [button.trailingAnchor constraintEqualToAnchor:host.trailingAnchor constant:-8],
             [button.widthAnchor constraintEqualToConstant:30],
             [button.heightAnchor constraintEqualToConstant:30]
         ]];
 
         if (!previousButton) {
             [NSLayoutConstraint activateConstraints:@[
-                [button.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-150]
+                [button.bottomAnchor constraintEqualToAnchor:host.bottomAnchor constant:-150]
             ]];
         } else {
             [NSLayoutConstraint activateConstraints:@[
@@ -1440,6 +1998,9 @@ static void setupButtons(IGStoryFullscreenCell *self) {
             thetaStorySkipIfEnabled(firstDel);
         });
     }
+    } @finally {
+        s_guard = NO;
+    }
 }
 
 static id (*orig_storyGhost)(id self, SEL _cmd);
@@ -1461,7 +2022,45 @@ static id hook_storyGhost(id self, SEL _cmd) {
     return media;
 }
 
-static void (*orig_storyGhost2)(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen);
+static void (*orig_storyGhostLayout)(id self, SEL _cmd);
+static void hook_storyGhostLayout(id self, SEL _cmd) {
+    if (orig_storyGhostLayout) orig_storyGhostLayout(self, _cmd);
+    @try {
+        setupButtons(self);
+    } @catch (NSException *exception) {
+        NSLog(@"[Theta] StoryGhost layout setupButtons: %@", exception);
+    }
+}
+
+static void (*orig_storyGhostDidMoveToWindow)(id self, SEL _cmd);
+static void hook_storyGhostDidMoveToWindow(id self, SEL _cmd) {
+    if (orig_storyGhostDidMoveToWindow) orig_storyGhostDidMoveToWindow(self, _cmd);
+    if (![(UIView *)self window]) return;
+    @try {
+        setupButtons(self);
+    } @catch (__unused NSException *e) {}
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try { setupButtons(self); } @catch (__unused NSException *e) {}
+    });
+}
+
+static void (*orig_storyOverlayLayout)(id self, SEL _cmd);
+static void hook_storyOverlayLayout(id self, SEL _cmd) {
+    if (orig_storyOverlayLayout) orig_storyOverlayLayout(self, _cmd);
+    UIView *v = (UIView *)self;
+    Class cellCls = theta_storyFullscreenCellClass();
+    while (v) {
+        if (cellCls && [v isKindOfClass:cellCls]) {
+            @try { setupButtons((IGStoryFullscreenCell *)v); } @catch (__unused NSException *e) {}
+            break;
+        }
+        v = v.superview;
+    }
+    for (UIView *sub in [((UIView *)self).subviews copy]) {
+        if (sub.tag == kThetaStoryButtonTag) [(UIView *)self bringSubviewToFront:sub];
+    }
+}
+
 static void hook_storyGhost2(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen) {
     if (!orig_storyGhost2) return;
 
@@ -1472,7 +2071,6 @@ static void hook_storyGhost2(id self, SEL _cmd, id fullscreenSectionController, 
                 orig_storyGhost2(self, _cmd, fullscreenSectionController, didMarkItemAsSeen);
             } @catch (__unused NSException *e) {
             }
-            // Restore any temporary networker swaps; do not leave the viewer stripped.
             THStorySeenReceiptNetworkGuardLeave();
             return;
         }
@@ -1489,6 +2087,54 @@ static void hook_storyGhost2(id self, SEL _cmd, id fullscreenSectionController, 
             orig_storyGhost2(self, _cmd, fullscreenSectionController, didMarkItemAsSeen);
         } @catch (__unused NSException *e) {
         }
+    }
+}
+
+static void hook_storyGhost3(id self, SEL _cmd, id fullscreenSectionController, id didMarkItemAsSeen, NSInteger entryPoint) {
+    if (!orig_storyGhost3) return;
+    if (!ENABLED(@"Story Ghost")) {
+        if (ENABLED(@"Seen Receipts Stay Local")) {
+            THStorySeenReceiptNetworkGuardEnterWithContext(fullscreenSectionController, self);
+            @try {
+                orig_storyGhost3(self, _cmd, fullscreenSectionController, didMarkItemAsSeen, entryPoint);
+            } @catch (__unused NSException *e) {}
+            THStorySeenReceiptNetworkGuardLeave();
+            return;
+        }
+        @try {
+            orig_storyGhost3(self, _cmd, fullscreenSectionController, didMarkItemAsSeen, entryPoint);
+        } @catch (__unused NSException *e) {}
+        return;
+    }
+    if (shouldBeSeen) {
+        shouldBeSeen = false;
+        @try {
+            orig_storyGhost3(self, _cmd, fullscreenSectionController, didMarkItemAsSeen, entryPoint);
+        } @catch (__unused NSException *e) {}
+    }
+}
+
+static void hook_sectionMarkCurrent(id self, SEL _cmd) {
+    if (!orig_sectionMarkCurrent) return;
+    if (!ENABLED(@"Story Ghost")) {
+        @try { orig_sectionMarkCurrent(self, _cmd); } @catch (__unused NSException *e) {}
+        return;
+    }
+    if (shouldBeSeen) {
+        shouldBeSeen = false;
+        @try { orig_sectionMarkCurrent(self, _cmd); } @catch (__unused NSException *e) {}
+    }
+}
+
+static void hook_sectionMarkItem(id self, SEL _cmd, id item) {
+    if (!orig_sectionMarkItem) return;
+    if (!ENABLED(@"Story Ghost")) {
+        @try { orig_sectionMarkItem(self, _cmd, item); } @catch (__unused NSException *e) {}
+        return;
+    }
+    if (shouldBeSeen) {
+        shouldBeSeen = false;
+        @try { orig_sectionMarkItem(self, _cmd, item); } @catch (__unused NSException *e) {}
     }
 }
 
@@ -1629,14 +2275,58 @@ static void performStoryDownloadWithURL(NSURL *url) {
 }
 
 void THRegisterStoryGhostHooks(void) {
-    Class cellCls = ThetaFirstClass(@[ @"IGStoryFullscreenCell" ]);
+    Class cellCls = theta_storyFullscreenCellClass() ?: ThetaFirstClass(@[ @"IGStoryFullscreenCell" ]);
     Class viewerCls = ThetaFirstClass(@[ @"IGStoryViewerViewController" ]);
+    Class overlayCls = ThetaFirstClass(@[
+        @"IGStoryFullscreenOverlayView",
+        @"IGStoryOverlayView"
+    ]);
     NullHookMessageIfPresent(cellCls, @selector(mediaView), (void *)hook_storyGhost, &orig_storyGhost);
-    NullHookMessageIfPresent(viewerCls, @selector(fullscreenSectionController:didMarkItemAsSeen:), (void *)hook_storyGhost2, &orig_storyGhost2);
-    if (!orig_storyGhost) {
-        NSLog(@"[Theta] StoryGhost: mediaView hook missing orig — overlay may be unavailable");
+    NullHookMessageIfPresent(cellCls, @selector(layoutSubviews), (void *)hook_storyGhostLayout, &orig_storyGhostLayout);
+    NullHookMessageIfPresent(cellCls, @selector(didMoveToWindow), (void *)hook_storyGhostDidMoveToWindow, &orig_storyGhostDidMoveToWindow);
+    NullHookMessageIfPresent(overlayCls, @selector(layoutSubviews), (void *)hook_storyOverlayLayout, &orig_storyOverlayLayout);
+
+    SEL markSel = @selector(fullscreenSectionController:didMarkItemAsSeen:);
+    SEL markSel3 = NSSelectorFromString(@"fullscreenSectionController:didMarkItemAsSeen:entryPoint:");
+    NullHookMessageIfPresent(viewerCls, markSel, (void *)hook_storyGhost2, &orig_storyGhost2);
+    NullHookMessageIfPresent(viewerCls, markSel3, (void *)hook_storyGhost3, &orig_storyGhost3);
+
+    Class sectionCls = ThetaFirstClass(@[ @"IGStoryFullscreenSectionController" ]);
+    NullHookMessageIfPresent(sectionCls, NSSelectorFromString(@"markCurrentItemAsSeen"), (void *)hook_sectionMarkCurrent, &orig_sectionMarkCurrent);
+    NullHookMessageIfPresent(sectionCls, NSSelectorFromString(@"markItemAsSeen:"), (void *)hook_sectionMarkItem, &orig_sectionMarkItem);
+
+    // Extra named classes only — objc_getClassList realizeAllClasses() crashes IG 446+ Swift metadata.
+    NSArray<NSString *> *extraViewers = @[
+        @"IGStoryViewerViewController",
+        @"IGStoryViewerViewControllerV2"
+    ];
+    NSArray<NSString *> *extraSections = @[
+        @"IGStoryFullscreenSectionController",
+        @"IGStorySectionController"
+    ];
+    for (NSString *cn in extraViewers) {
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+        if (!orig_storyGhost2)
+            NullHookMessageIfPresent(c, markSel, (void *)hook_storyGhost2, &orig_storyGhost2);
+        if (!orig_storyGhost3)
+            NullHookMessageIfPresent(c, markSel3, (void *)hook_storyGhost3, &orig_storyGhost3);
     }
-    if (!orig_storyGhost2) {
-        NSLog(@"[Theta] StoryGhost: didMarkItemAsSeen hook missing orig — mark-seen actions are no-ops");
+    for (NSString *cn in extraSections) {
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+        if (!orig_sectionMarkCurrent)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"markCurrentItemAsSeen"), (void *)hook_sectionMarkCurrent, &orig_sectionMarkCurrent);
+        if (!orig_sectionMarkItem)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"markItemAsSeen:"), (void *)hook_sectionMarkItem, &orig_sectionMarkItem);
+        if (!orig_sectionMarkItem)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"_markItemAsSeen:"), (void *)hook_sectionMarkItem, &orig_sectionMarkItem);
+    }
+
+    if (!orig_storyGhost && !orig_storyGhostLayout && !orig_storyGhostDidMoveToWindow) {
+        NSLog(@"[Theta] StoryGhost: no cell overlay hook installed — story buttons may be unavailable");
+    }
+    if (!orig_storyGhost2 && !orig_storyGhost3) {
+        NSLog(@"[Theta] StoryGhost: didMarkItemAsSeen hook missing orig — will try live msgSend + section mark APIs");
     }
 }

@@ -10,7 +10,44 @@ void theta_showMarkedAsSeenToastDeferred(void);
 void theta_performMarkLastMessageAsSeen(id threadViewController, id listViewController);
 id theta_activeDirectThreadViewController(void);
 static const NSTimeInterval kThetaEmptyStableSeconds = 0.75; // require empty to be stable before reset
+static const NSInteger kThetaBypassCharacterLimitValue = 99999999;
 static void (*orig_directComposer2)(id self, SEL _cmd);
+static NSInteger (*orig_characterLimit)(id self, SEL _cmd);
+
+static void theta_applyComposerCharacterLimitBypass(id composer) {
+    if (!composer) {
+        return;
+    }
+
+    SEL setLimit = @selector(setCharacterLimit:);
+    if ([composer respondsToSelector:setLimit]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(composer, setLimit, kThetaBypassCharacterLimitValue);
+        return;
+    }
+
+    Ivar characterLimitIvar = class_getInstanceVariable([composer class], "characterLimit");
+    if (!characterLimitIvar) {
+        characterLimitIvar = class_getInstanceVariable([composer class], "_characterLimit");
+    }
+    if (!characterLimitIvar) {
+        return;
+    }
+
+    const char *encoding = ivar_getTypeEncoding(characterLimitIvar);
+    if (encoding && encoding[0] == '@') {
+        object_setIvar(composer, characterLimitIvar, @(kThetaBypassCharacterLimitValue));
+    } else {
+        *(NSInteger *)((char *)(__bridge void *)composer + ivar_getOffset(characterLimitIvar)) = kThetaBypassCharacterLimitValue;
+    }
+}
+
+static NSInteger hook_characterLimit(id self, SEL _cmd) {
+    if (ENABLED(@"Bypass Character Limit")) {
+        return kThetaBypassCharacterLimitValue;
+    }
+    return orig_characterLimit(self, _cmd);
+}
+
 static void hook_directComposer2(id self, SEL _cmd) {
     @try {
         orig_directComposer2(self, _cmd);
@@ -191,19 +228,8 @@ static void hook_directComposer2(id self, SEL _cmd) {
         if (!ENABLED(@"Bypass Character Limit")) {
             return;
         }
-        
-        if (!self) {
-            return;
-        }
-        
-        Ivar characterLimitIvar = class_getInstanceVariable([self class], "_characterLimit");
-        if (!characterLimitIvar) {
-            NSLog(@"Character limit ivar not found");
-            return;
-        }
-        
-        NSInteger characterLimit = 99999999;
-        object_setIvar(self, characterLimitIvar, @(characterLimit));
+
+        theta_applyComposerCharacterLimitBypass(self);
     } @catch (NSException *exception) {
         NSLog(@"Error in character limit bypass: %@", exception);
     }
@@ -215,4 +241,5 @@ void THRegisterBypassCharacterLimitHooks(void) {
         @"_TtC16IGDirectComposer16IGDirectComposer",
     ]);
     NullHookMessageIfPresent(composer, @selector(layoutSubviews), (void *)hook_directComposer2, &orig_directComposer2);
+    NullHookMessageIfPresent(composer, @selector(characterLimit), (void *)hook_characterLimit, &orig_characterLimit);
 }

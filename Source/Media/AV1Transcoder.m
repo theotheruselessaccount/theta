@@ -35,6 +35,7 @@ FUNC_PTR(av_guess_frame_rate);
 
 // avcodec functions
 FUNC_PTR(avcodec_find_decoder);
+FUNC_PTR(avcodec_find_decoder_by_name);
 FUNC_PTR(avcodec_find_encoder);
 FUNC_PTR(avcodec_find_encoder_by_name);
 FUNC_PTR(avcodec_alloc_context3);
@@ -152,6 +153,7 @@ static BOOL loadFFmpegLibraries(NSError **error) {
     
     // avcodec
     LOAD_FUNC(libavcodec_handle, avcodec_find_decoder);
+    p_avcodec_find_decoder_by_name = dlsym(libavcodec_handle, "avcodec_find_decoder_by_name");
     LOAD_FUNC(libavcodec_handle, avcodec_find_encoder);
     LOAD_FUNC(libavcodec_handle, avcodec_find_encoder_by_name);
     LOAD_FUNC(libavcodec_handle, avcodec_alloc_context3);
@@ -203,6 +205,23 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
     if (audioCtx && *audioCtx) {
         p_avformat_close_input(audioCtx);
     }
+}
+
+static BOOL av1_ensure_sws(struct SwsContext **sws, int *haveW, int *haveH, enum AVPixelFormat *haveFmt,
+                           int srcW, int srcH, enum AVPixelFormat srcFmt,
+                           int dstW, int dstH, enum AVPixelFormat dstFmt, int flags) {
+    if (!sws || srcFmt == AV_PIX_FMT_NONE || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return NO;
+    if (*sws && *haveW == srcW && *haveH == srcH && *haveFmt == srcFmt) return YES;
+    if (*sws) {
+        p_sws_freeContext(*sws);
+        *sws = NULL;
+    }
+    *sws = p_sws_getContext(srcW, srcH, srcFmt, dstW, dstH, dstFmt, flags, NULL, NULL, NULL);
+    if (!*sws) return NO;
+    *haveW = srcW;
+    *haveH = srcH;
+    *haveFmt = srcFmt;
+    return YES;
 }
 
 @implementation AV1Transcoder
@@ -319,13 +338,20 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
     AVRational frameRate = p_av_guess_frame_rate(inputFormatContext, videoStream, NULL);
     double fps = (double)frameRate.num / frameRate.den;
     
-    // Find AV1 decoder
-    const AVCodec *decoder = p_avcodec_find_decoder(videoStream->codecpar->codec_id);
+    // Prefer libvpx for VP9 — the built-in decoder is often missing or incomplete.
+    const AVCodec *decoder = NULL;
+    enum AVCodecID srcCodecId = videoStream->codecpar->codec_id;
+    if ((srcCodecId == AV_CODEC_ID_VP9 || srcCodecId == AV_CODEC_ID_VP8) && p_avcodec_find_decoder_by_name) {
+        decoder = p_avcodec_find_decoder_by_name(srcCodecId == AV_CODEC_ID_VP8 ? "libvpx" : "libvpx-vp9");
+    }
     if (!decoder) {
-        NSLog(@"Could not find decoder for codec %s", p_avcodec_get_name(videoStream->codecpar->codec_id));
+        decoder = p_avcodec_find_decoder(srcCodecId);
+    }
+    if (!decoder) {
+        NSLog(@"Could not find decoder for codec %s", p_avcodec_get_name(srcCodecId));
         av1_close_audio_format_context(&audioFormatContext);
         p_avformat_close_input(&inputFormatContext);
-        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Could not find AV1 decoder"}];
+        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Could not find video decoder"}];
         return NO;
     }
     
@@ -350,9 +376,11 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
         return NO;
     }
     
-    // Enable multi-threading for AV1 decoder (CRITICAL for performance)
-    decoderContext->thread_count = 0; // Auto-detect CPU cores
-    decoderContext->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; // Enable both frame and slice threading
+    // VP9/libvpx often rejects combined FRAME|SLICE threading.
+    decoderContext->thread_count = 0;
+    decoderContext->thread_type = (srcCodecId == AV_CODEC_ID_VP9 || srcCodecId == AV_CODEC_ID_VP8)
+        ? FF_THREAD_FRAME
+        : (FF_THREAD_FRAME | FF_THREAD_SLICE);
     
     // Open decoder
     ret = p_avcodec_open2(decoderContext, decoder, NULL);
@@ -361,7 +389,7 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
         p_avcodec_free_context(&decoderContext);
         av1_close_audio_format_context(&audioFormatContext);
         p_avformat_close_input(&inputFormatContext);
-        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:ret userInfo:@{NSLocalizedDescriptionKey: @"Could not open AV1 decoder"}];
+        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:ret userInfo:@{NSLocalizedDescriptionKey: @"Could not open video decoder"}];
         return NO;
     }
     
@@ -444,9 +472,23 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
         return NO;
     }
     
-    // Set encoder parameters
-    encoderContext->width = decoderContext->width;
-    encoderContext->height = decoderContext->height;
+    // Set encoder parameters (VP9 decoder ctx can be 0x0 until the first frame)
+    int encW = decoderContext->width > 0 ? decoderContext->width : videoStream->codecpar->width;
+    int encH = decoderContext->height > 0 ? decoderContext->height : videoStream->codecpar->height;
+    if (encW <= 0 || encH <= 0) {
+        NSLog(@"Could not determine video dimensions");
+        p_avcodec_free_context(&encoderContext);
+        p_avformat_free_context(outputFormatContext);
+        p_avcodec_free_context(&decoderContext);
+        av1_close_audio_format_context(&audioFormatContext);
+        p_avformat_close_input(&inputFormatContext);
+        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Could not determine video dimensions"}];
+        return NO;
+    }
+    encoderContext->width = encW & ~1;
+    encoderContext->height = encH & ~1;
+    if (encoderContext->width < 2) encoderContext->width = 2;
+    if (encoderContext->height < 2) encoderContext->height = 2;
     
     // Preserve color space and HDR metadata
     encoderContext->color_primaries = decoderContext->color_primaries;
@@ -478,9 +520,11 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
         encoderContext->max_b_frames = 0; // VideoToolbox doesn't use B-frames by default
         
         // VideoToolbox options
-        p_av_opt_set(encoderContext->priv_data, "allow_sw", "0", 0); // Force hardware
-        p_av_opt_set(encoderContext->priv_data, "realtime", "true", 0); // Real-time encoding
-        p_av_opt_set_int(encoderContext->priv_data, "prio_speed", 1, 0); // Prioritize speed
+        if (encoderContext->priv_data) {
+            p_av_opt_set(encoderContext->priv_data, "allow_sw", "1", 0);
+            p_av_opt_set(encoderContext->priv_data, "realtime", "true", 0);
+            p_av_opt_set_int(encoderContext->priv_data, "prio_speed", 1, 0);
+        }
     } else {
         // Software encoder settings
         encoderContext->max_b_frames = 2;
@@ -587,27 +631,11 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
     
     if (progressBlock) progressBlock(@"Starting.. (20%)", 0.20);
     
-    // Initialize scaler for pixel format conversion
-    // Use fast scaler for speed while maintaining good quality
-    int scalerFlags = SWS_FAST_BILINEAR | SWS_ACCURATE_RND; // Fast and accurate enough for video
-    swsContext = p_sws_getContext(
-        decoderContext->width, decoderContext->height, decoderContext->pix_fmt,
-        encoderContext->width, encoderContext->height, encoderContext->pix_fmt,
-        scalerFlags, NULL, NULL, NULL
-    );
-    
-    if (!swsContext) {
-        NSLog(@"Could not initialize scaler");
-        p_av_write_trailer(outputFormatContext);
-        p_avio_closep(&outputFormatContext->pb);
-        p_avcodec_free_context(&encoderContext);
-        p_avformat_free_context(outputFormatContext);
-        p_avcodec_free_context(&decoderContext);
-        av1_close_audio_format_context(&audioFormatContext);
-        p_avformat_close_input(&inputFormatContext);
-        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Could not initialize scaler"}];
-        return NO;
-    }
+    // VP9 often has pix_fmt = NONE until the first frame. Build the scaler then.
+    enum AVPixelFormat scalerSrcFmt = AV_PIX_FMT_NONE;
+    int scalerSrcW = 0;
+    int scalerSrcH = 0;
+    int scalerFlags = SWS_FAST_BILINEAR | SWS_ACCURATE_RND;
     
     // Allocate frames
     AVFrame *decodedFrame = p_av_frame_alloc();
@@ -669,10 +697,21 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
                     break;
                 }
                 
-                // Convert pixel format
+                enum AVPixelFormat srcFmt = (enum AVPixelFormat)decodedFrame->format;
+                if (srcFmt == AV_PIX_FMT_NONE) srcFmt = decoderContext->pix_fmt;
+                int srcW = decodedFrame->width > 0 ? decodedFrame->width : decoderContext->width;
+                int srcH = decodedFrame->height > 0 ? decodedFrame->height : decoderContext->height;
+                if (!av1_ensure_sws(&swsContext, &scalerSrcW, &scalerSrcH, &scalerSrcFmt,
+                                    srcW, srcH, srcFmt,
+                                    encoderContext->width, encoderContext->height, encoderContext->pix_fmt,
+                                    scalerFlags)) {
+                    NSLog(@"Could not initialize scaler (src pix_fmt=%d %dx%d)", (int)srcFmt, srcW, srcH);
+                    p_av_frame_unref(decodedFrame);
+                    continue;
+                }
                 p_sws_scale(swsContext,
                          (const uint8_t * const *)decodedFrame->data, decodedFrame->linesize,
-                         0, decoderContext->height,
+                         0, srcH,
                          encodedFrame->data, encodedFrame->linesize);
                 
                 // Preserve timing and color metadata
@@ -813,9 +852,20 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
     // Flush decoder
     p_avcodec_send_packet(decoderContext, NULL);
     while (p_avcodec_receive_frame(decoderContext, decodedFrame) >= 0) {
+        enum AVPixelFormat srcFmt = (enum AVPixelFormat)decodedFrame->format;
+        if (srcFmt == AV_PIX_FMT_NONE) srcFmt = decoderContext->pix_fmt;
+        int srcW = decodedFrame->width > 0 ? decodedFrame->width : decoderContext->width;
+        int srcH = decodedFrame->height > 0 ? decodedFrame->height : decoderContext->height;
+        if (!av1_ensure_sws(&swsContext, &scalerSrcW, &scalerSrcH, &scalerSrcFmt,
+                            srcW, srcH, srcFmt,
+                            encoderContext->width, encoderContext->height, encoderContext->pix_fmt,
+                            scalerFlags)) {
+            p_av_frame_unref(decodedFrame);
+            continue;
+        }
         p_sws_scale(swsContext,
                  (const uint8_t * const *)decodedFrame->data, decodedFrame->linesize,
-                 0, decoderContext->height,
+                 0, srcH,
                  encodedFrame->data, encodedFrame->linesize);
         encodedFrame->pts = decodedFrame->pts;
         p_avcodec_send_frame(encoderContext, encodedFrame);
@@ -848,6 +898,24 @@ static void av1_close_audio_format_context(AVFormatContext **audioCtx) {
         NSLog(@"ℹ️ No audio in source");
     }
     
+    if (frameCount <= 0) {
+        NSLog(@"Transcode produced no video frames");
+        if (decodedFrame) p_av_frame_free(&decodedFrame);
+        if (encodedFrame) p_av_frame_free(&encodedFrame);
+        if (packet) p_av_packet_free(&packet);
+        if (outputPacket) p_av_packet_free(&outputPacket);
+        if (swsContext) p_sws_freeContext(swsContext);
+        p_av_write_trailer(outputFormatContext);
+        p_avio_closep(&outputFormatContext->pb);
+        p_avcodec_free_context(&encoderContext);
+        p_avformat_free_context(outputFormatContext);
+        p_avcodec_free_context(&decoderContext);
+        av1_close_audio_format_context(&audioFormatContext);
+        p_avformat_close_input(&inputFormatContext);
+        if (error) *error = [NSError errorWithDomain:@"AV1Transcoder" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"Could not decode video frames"}];
+        return NO;
+    }
+
     if (progressBlock) progressBlock(@"Finalizing.. (98%)", 0.98);
     
     // Write trailer

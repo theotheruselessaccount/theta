@@ -1,4 +1,6 @@
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
 
 @class NSURL;
 
@@ -39,3 +41,10 @@ FOUNDATION_EXPORT void ThetaPhotoLibraryImportVideoFromURL(NSURL *fileURL, void 
 
 /** Re-encode with AVFoundation so Photos will accept the file (AV1 on iOS 17+). */
 FOUNDATION_EXPORT BOOL ThetaExportPhotosCompatibleMP4(NSString *videoPath, NSString *audioPath, BOOL hasAudio, NSString *outputPath);
+
+/** Decode with AVAssetReader (VP9/AV1 on recent iOS) and write H.264 via AVAssetWriter. */
+FOUNDATION_EXPORT BOOL ThetaTranscodeWithAssetReaderWriter(NSString *videoPath, NSString *audioPath, BOOL hasAudio, NSString *outputPath);
+
+/** AV1 / VP9 / VP8 — AVAssetExportSession cannot produce a Photos-safe MP4. */
+FOUNDATION_EXPORT BOOL ThetaVideoFourCCNeedsFFmpegTranscode(FourCharCode codec);
+FOUNDATION_EXPORT BOOL ThetaAssetVideoNeedsFFmpegTranscode(AVAsset *asset);

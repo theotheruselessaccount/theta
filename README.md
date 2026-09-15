@@ -51,8 +51,8 @@ FFmpeg headers and frameworks live at `layout/Library/Application Support/ffmpeg
 
 1. Build with `./build.sh` or `./build.sh rootless`.
 2. Copy the `.deb` from `packages/` to the device and install it with Sileo, Zebra, or `dpkg -i`.
-   - Rootful: `packages/com.theta.tweak_1.0.0_iphoneos-arm.deb`
-   - Rootless: `packages/com.theta.tweak_1.0.0_iphoneos-arm64.deb`
+   - Rootful: `packages/com.theta.tweak_1.0.1_iphoneos-arm.deb`
+   - Rootless: `packages/com.theta.tweak_1.0.1_iphoneos-arm64.deb`
 3. Respring if the package manager does not, then open Instagram.
 
 If Theos device install is already configured (`THEOS_DEVICE_IP`), `make install` / `make install ROOTLESS=1` will install and reopen Instagram.
@@ -83,6 +83,8 @@ If Theos device install is already configured (`THEOS_DEVICE_IP`), `make install
 
 If Substrate cannot be found automatically, set `SUBSTRATE_FRAMEWORK_PATH` to a `CydiaSubstrate.framework` directory, or place one at `third_party/CydiaSubstrate.framework`.
 
+Sideload also injects `ThetaNSE` into Instagram’s notification service extension so decrypted banners can work. `Source/SideloadNSE/keychain-sharing.plist` is **optional** and is not applied by the build. Skip it unless notifications break because the extension cannot read Instagram’s keychain. In that case, merge those entitlements onto `Instagram.app` and `InstagramNotificationExtension.appex` only (never onto `ThetaNSE` or other dylibs), and replace `TEAMID` with your signing Team ID. Theta already probes wildcard keychain groups at runtime, so most sideload installs do not need this plist.
+
 ## Known issues
 
 | Area | Scope | Status |
@@ -104,6 +106,7 @@ Source/
     Save/           Media / profile / audio saves
     UI/             Tabs, navigation, settings entry points
     Sideload/       Keychain / app-group fakes
+  SideloadNSE/      Sideload notification-extension helper (`keychain-sharing.plist` is optional)
   UI/               Settings, toasts, helpers, lock screen
   Media/            Download UI, AV1 transcoder, DASH
   ProfileAnalyzer/  Follower analytics

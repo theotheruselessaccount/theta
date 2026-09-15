@@ -23,6 +23,7 @@ OUTPUT = ROOT / "TweakCOMPILE.xm"
 PRE = [
     ROOT / "Source/Runtime/THGlobalsAndHooking.m",
     ROOT / "Source/Runtime/THNativeToast.m",
+    ROOT / "Source/SideloadNSE/ThetaHPKEKeyFile.m",
     ROOT / "Source/Runtime/THSideloadFishhook.m",
     ROOT / "Source/Runtime/THSubstrate.m",
 ]

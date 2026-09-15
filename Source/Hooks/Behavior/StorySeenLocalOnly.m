@@ -1,6 +1,7 @@
 #import "Include.h"
 #import "Include/ThetaTweakCommon.h"
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 /* Block story seen uploads while optionally leaving local/UI state untouched. */
 
@@ -309,7 +310,124 @@ static id hook_sundialMgrInit(id self, SEL _cmd, id networker, id diskMgr, id la
 #pragma mark - Uploader hooks
 
 static BOOL theta_blockSeenReceipts(void) {
+    if (s_thetaAllowStorySeenReceipts) return NO;
+    if (s_thetaLocalSeenMarkActive) return YES;
     return ENABLED(@"Seen Receipts Stay Local");
+}
+
+static BOOL theta_stringLooksLikeStorySeen(NSString *s) {
+    if (!s.length) return NO;
+    NSString *l = s.lowercaseString;
+    if ([l containsString:@"polarisstories"] && [l containsString:@"seen"]) return YES;
+    if ([l containsString:@"storiesv3seen"]) return YES;
+    if ([l containsString:@"storiesv2seen"]) return YES;
+    if ([l containsString:@"seenmutation"]) return YES;
+    if ([l containsString:@"mark_reel_seen"]) return YES;
+    if ([l containsString:@"reel_seen"]) return YES;
+    if ([l containsString:@"story_seen"]) return YES;
+    if ([l containsString:@"stories/reel/seen"]) return YES;
+    if ([l containsString:@"/media/seen"]) return YES;
+    if ([l containsString:@"seen_reels"]) return YES;
+    if ([l containsString:@"seenstatemutation"]) return YES;
+    if ([l containsString:@"igstoryseen"]) return YES;
+    return NO;
+}
+
+static BOOL theta_urlLooksLikeStorySeen(NSURL *url) {
+    if (!url) return NO;
+    return theta_stringLooksLikeStorySeen(url.absoluteString) || theta_stringLooksLikeStorySeen(url.path);
+}
+
+static BOOL theta_requestLooksLikeStorySeen(NSURLRequest *req) {
+    if (![req isKindOfClass:[NSURLRequest class]]) return NO;
+    if (theta_urlLooksLikeStorySeen(req.URL)) return YES;
+    NSData *body = req.HTTPBody;
+    if (body.length && body.length < 256u * 1024u) {
+        NSString *s = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+        if (!s) s = [[NSString alloc] initWithData:body encoding:NSISOLatin1StringEncoding];
+        if (theta_stringLooksLikeStorySeen(s)) return YES;
+    }
+    return NO;
+}
+
+static BOOL theta_payloadLooksLikeStorySeen(id obj) {
+    if (!obj) return NO;
+    if ([obj isKindOfClass:[NSURLRequest class]]) return theta_requestLooksLikeStorySeen(obj);
+    if ([obj isKindOfClass:[NSURL class]]) return theta_urlLooksLikeStorySeen(obj);
+    if ([obj isKindOfClass:[NSString class]]) return theta_stringLooksLikeStorySeen(obj);
+    NSURL *url = nil;
+    @try { url = [obj valueForKey:@"URL"]; } @catch (__unused NSException *e) {}
+    if (![url isKindOfClass:[NSURL class]]) {
+        @try { url = [obj valueForKey:@"url"]; } @catch (__unused NSException *e) {}
+    }
+    if ([url isKindOfClass:[NSURL class]] && theta_urlLooksLikeStorySeen(url)) return YES;
+    id inner = nil;
+    @try { inner = [obj valueForKey:@"request"]; } @catch (__unused NSException *e) {}
+    if ([inner isKindOfClass:[NSURLRequest class]] && theta_requestLooksLikeStorySeen(inner)) return YES;
+    NSString *name = nil;
+    @try { name = [obj valueForKey:@"queryName"]; } @catch (__unused NSException *e) {}
+    if (![name isKindOfClass:[NSString class]]) {
+        @try { name = [obj valueForKey:@"friendlyName"]; } @catch (__unused NSException *e) {}
+    }
+    if ([name isKindOfClass:[NSString class]] && theta_stringLooksLikeStorySeen(name)) return YES;
+    return NO;
+}
+
+static BOOL theta_shouldDropStorySeenTraffic(id payload) {
+    if (!theta_blockSeenReceipts()) return NO;
+    return theta_payloadLooksLikeStorySeen(payload);
+}
+
+static NSURLRequest *theta_dummySeenRequest(void) {
+    return [NSURLRequest requestWithURL:[NSURL URLWithString:@"data:text/plain,"]];
+}
+
+static NSURLSessionDataTask *(*orig_nsurl_dataTaskReqComp)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionDataTask *hook_nsurl_dataTaskReqComp(id self, SEL _cmd, NSURLRequest *req, void (^comp)(NSData *, NSURLResponse *, NSError *)) {
+    if (theta_shouldDropStorySeenTraffic(req)) {
+        if (comp) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+                comp(nil, nil, err);
+            });
+        }
+        NSURLSessionDataTask *task = orig_nsurl_dataTaskReqComp ? orig_nsurl_dataTaskReqComp(self, _cmd, theta_dummySeenRequest(), nil) : nil;
+        [task cancel];
+        return task;
+    }
+    return orig_nsurl_dataTaskReqComp(self, _cmd, req, comp);
+}
+
+static NSURLSessionDataTask *(*orig_nsurl_dataTaskReq)(id, SEL, NSURLRequest *);
+static NSURLSessionDataTask *hook_nsurl_dataTaskReq(id self, SEL _cmd, NSURLRequest *req) {
+    if (theta_shouldDropStorySeenTraffic(req)) {
+        NSURLSessionDataTask *task = orig_nsurl_dataTaskReq ? orig_nsurl_dataTaskReq(self, _cmd, theta_dummySeenRequest()) : nil;
+        [task cancel];
+        return task;
+    }
+    return orig_nsurl_dataTaskReq(self, _cmd, req);
+}
+
+static NSURLSessionUploadTask *(*orig_nsurl_uploadReqDataComp)(id, SEL, NSURLRequest *, NSData *, void (^)(NSData *, NSURLResponse *, NSError *));
+static NSURLSessionUploadTask *hook_nsurl_uploadReqDataComp(id self, SEL _cmd, NSURLRequest *req, NSData *data, void (^comp)(NSData *, NSURLResponse *, NSError *)) {
+    if (theta_shouldDropStorySeenTraffic(req) || (theta_blockSeenReceipts() && theta_stringLooksLikeStorySeen([[NSString alloc] initWithData:data ?: [NSData data] encoding:NSUTF8StringEncoding]))) {
+        if (comp) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSError *err = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:nil];
+                comp(nil, nil, err);
+            });
+        }
+        NSURLSessionUploadTask *task = orig_nsurl_uploadReqDataComp ? orig_nsurl_uploadReqDataComp(self, _cmd, theta_dummySeenRequest(), [NSData data], nil) : nil;
+        [task cancel];
+        return task;
+    }
+    return orig_nsurl_uploadReqDataComp(self, _cmd, req, data, comp);
+}
+
+static void (*orig_dropSeenReq1)(id, SEL, id);
+static void hook_dropSeenReq1(id self, SEL _cmd, id req) {
+    if (theta_shouldDropStorySeenTraffic(req)) return;
+    if (orig_dropSeenReq1) orig_dropSeenReq1(self, _cmd, req);
 }
 
 static void (*orig_sundialUploadSeenStateIfNecessary)(id, SEL);
@@ -477,5 +595,78 @@ void THRegisterStorySeenLocalOnlyHooks(void) {
         NullHookMessageIfPresent(section, NSSelectorFromString(@"flushQueuedSeenRequests"), (void *)hook_sectionFlushQueuedSeenRequests, &orig_sectionFlushQueuedSeenRequests);
         NullHookMessageIfPresent(section, NSSelectorFromString(@"_flushQueuedSeenRequests"), (void *)hook_sectionFlushQueuedSeenRequestsPriv, &orig_sectionFlushQueuedSeenRequestsPriv);
         NullHookMessageIfPresent(section, NSSelectorFromString(@"enqueueSeenRequestForPlayhead"), (void *)hook_sectionEnqueueSeenForPlayhead, &orig_sectionEnqueueSeenForPlayhead);
+    }
+
+    Class nss = [NSURLSession class];
+    NullHookMessageIfPresent(nss, @selector(dataTaskWithRequest:completionHandler:), (void *)hook_nsurl_dataTaskReqComp, &orig_nsurl_dataTaskReqComp);
+    NullHookMessageIfPresent(nss, @selector(dataTaskWithRequest:), (void *)hook_nsurl_dataTaskReq, &orig_nsurl_dataTaskReq);
+    NullHookMessageIfPresent(nss, @selector(uploadTaskWithRequest:fromData:completionHandler:), (void *)hook_nsurl_uploadReqDataComp, &orig_nsurl_uploadReqDataComp);
+    Class nssLocal = objc_getClass("__NSURLSessionLocal");
+    if (nssLocal && nssLocal != nss) {
+        if (!orig_nsurl_dataTaskReqComp)
+            NullHookMessageIfPresent(nssLocal, @selector(dataTaskWithRequest:completionHandler:), (void *)hook_nsurl_dataTaskReqComp, &orig_nsurl_dataTaskReqComp);
+        if (!orig_nsurl_dataTaskReq)
+            NullHookMessageIfPresent(nssLocal, @selector(dataTaskWithRequest:), (void *)hook_nsurl_dataTaskReq, &orig_nsurl_dataTaskReq);
+        if (!orig_nsurl_uploadReqDataComp)
+            NullHookMessageIfPresent(nssLocal, @selector(uploadTaskWithRequest:fromData:completionHandler:), (void *)hook_nsurl_uploadReqDataComp, &orig_nsurl_uploadReqDataComp);
+    }
+
+    NSArray<NSString *> *reqHosts = @[
+        @"IGTigonNetworker",
+        @"FBTigonService",
+        @"TigonService",
+        @"IGGraphQLService",
+        @"IGGraphQLRequest",
+        @"IGAPIRequest",
+        @"IGURLRequest"
+    ];
+    NSArray<NSString *> *reqSels = @[
+        @"startRequest:",
+        @"addRequest:",
+        @"sendRequest:",
+        @"startWithRequest:",
+        @"startQuery:"
+    ];
+    for (NSString *cn in reqHosts) {
+        Class c = NSClassFromString(cn);
+        if (!c) continue;
+        for (NSString *sn in reqSels) {
+            SEL s = NSSelectorFromString(sn);
+            if (!class_getInstanceMethod(c, s)) continue;
+            if (!orig_dropSeenReq1)
+                NullHookMessageIfPresent(c, s, (void *)hook_dropSeenReq1, &orig_dropSeenReq1);
+        }
+    }
+
+    /* Do not call objc_getClassList here. It realizeAllClasses() and IG 446+ crashes in
+       swift_getSingletonMetadata (NULL metadata init). Named classes above are enough. */
+    NSArray<NSString *> *extraSeen = @[
+        @"IGStorySeenStateStore",
+        @"IGReelSeenStateStore",
+        @"IGReelSeenStateUploader",
+        @"IGSundialSeenStateManager",
+        @"_TtC23IGSundialSeenStateSwift25IGSundialSeenStateManager"
+    ];
+    for (NSString *cn in extraSeen) {
+        Class c = objc_getClass(cn.UTF8String);
+        if (!c) continue;
+        if (!orig_uploadSeenMedia)
+            NullHookMessageIfPresent(c, @selector(uploadSeenStateWithMedia:), (void *)hook_uploadSeenMedia, &orig_uploadSeenMedia);
+        if (!orig_uploadSeenState)
+            NullHookMessageIfPresent(c, @selector(uploadSeenState), (void *)hook_uploadSeenState, &orig_uploadSeenState);
+        if (!orig_uploadSeenStateArg)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"_uploadSeenState:"), (void *)hook_uploadSeenStateArg, &orig_uploadSeenStateArg);
+        if (!orig_sendSeenReceipt)
+            NullHookMessageIfPresent(c, @selector(sendSeenReceipt:), (void *)hook_sendSeenReceipt, &orig_sendSeenReceipt);
+        if (!orig_enqueueSeenStateForMedia)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"enqueueSeenStateForMedia:"), (void *)hook_enqueueSeenStateForMedia, &orig_enqueueSeenStateForMedia);
+        if (!orig_uploadSeenStateWithStoryItem)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"uploadSeenStateWithStoryItem:"), (void *)hook_uploadSeenStateWithStoryItem, &orig_uploadSeenStateWithStoryItem);
+        if (!orig_enqueueSeenStateWithStoryItem)
+            NullHookMessageIfPresent(c, NSSelectorFromString(@"enqueueSeenStateWithStoryItem:"), (void *)hook_enqueueSeenStateWithStoryItem, &orig_enqueueSeenStateWithStoryItem);
+        if (!orig_sundialUploadSeenStateIfNecessary)
+            NullHookMessageIfPresent(c, @selector(uploadSeenStateIfNecessary), (void *)hook_sundialUploadSeenStateIfNecessary, &orig_sundialUploadSeenStateIfNecessary);
+        if (!orig_sundialAppendSeenState)
+            NullHookMessageIfPresent(c, @selector(appendSeenState:), (void *)hook_sundialAppendSeenState, &orig_sundialAppendSeenState);
     }
 }
